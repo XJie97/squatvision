@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 # SquatVision
 
 **Video-based squat analysis using Python, MediaPipe and OpenCV.**
