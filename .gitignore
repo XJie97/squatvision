@@ -1,0 +1,13 @@
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+models/
+data/
+outputs/
+*.mp4
+*.mov
+*.avi
+*.png
+.env
