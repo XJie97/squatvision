@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # SquatVision
 
 **Video-based squat analysis using Python, MediaPipe and OpenCV.**
@@ -228,3 +229,7 @@ Video processing runs locally after the pretrained model is downloaded. Videos, 
 SquatVision is intended for **learning, experimentation and computer vision demonstrations**. It is not a validated tool for medical advice, injury prediction or official powerlifting judging.
 
 The repository's source code is MIT-licensed. The downloaded pretrained model and dependencies are third-party components subject to their respective terms.
+=======
+# squatvision
+SquatVision is a Python-based computer vision project using MediaPipe and OpenCV to analyse squat biomechanics, estimate joint angles and depth, track repetition phases, detect pauses, and generate timestamped movement analysis reports.
+>>>>>>> e8101716a7a221587c6966e2310bfbf49bd5c9b9
