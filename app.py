@@ -1,4 +1,4 @@
-"""SquatVision v3: one-person, fixed-camera, offline video squat analysis.
+"""SquatVision v5: one-person, fixed-camera, offline video squat analysis.
 
 Run: python download_model.py
      python app.py --input data/squat.mp4 --output outputs/demo
@@ -9,14 +9,18 @@ import csv
 import json
 import time
 from pathlib import Path
+from dataclasses import replace
+from collections import Counter
 import cv2
 import numpy as np
 from squatvision.analysis import Analysis, Config, FrameMetrics, analyse
 from squatvision.geometry import best_side, extract_frame
 from squatvision.depth import DepthCalibration, classify_depth, depth_status
-from squatvision.optical_flow import track_anatomy
+from squatvision.optical_flow import track_anatomy, calibration_from_manual_annotations
 from squatvision.diagnostics import export_plots
 from squatvision.render import overlay, screenshot_name
+from squatvision.batch import BatchInputError, run_batch
+from squatvision.ipf_depth import load_manual, apply_manual, measure, attempt_depth, UNAVAILABLE, MANUAL, VERIFIED
 
 
 def export_csv(path: Path, rows: list[dict], fields: list[str]):
@@ -28,11 +32,15 @@ def export_csv(path: Path, rows: list[dict], fields: list[str]):
 
 def run(video: Path, output: Path, model: Path, side: str, config: Config,
         min_visibility: float, start_time: float, end_time: float | None,
-        no_video: bool, depth_calibration: Path | None = None) -> None:
+        no_video: bool, depth_calibration: Path | None = None,
+        manual_annotations: Path | None = None,
+        manual_only: bool = False) -> None:
     try:
         import mediapipe as mp
     except ImportError as exc:
         raise SystemExit('MediaPipe unavailable. Install requirements in Python 3.11/3.12.') from exc
+    if manual_only and depth_calibration is not None:
+        raise SystemExit('--manual-only cannot be combined with --depth-calibration.')
     if not video.is_file():
         raise SystemExit(f'Video not found: {video}')
     if not model.is_file():
@@ -104,8 +112,44 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
     elapsed=time.perf_counter()-t0
     if not frames:
         raise SystemExit('No frames selected for analysis.')
+    manual_points=(load_manual(manual_annotations,video.name,width,height,fps)
+                   if manual_annotations is not None else {})
+    # A manual annotation is a verified image point at ONE frame, not a video
+    # track. When no separate depth calibration is supplied, automatically
+    # initialise optical flow from suitable manually labelled pose frames.
+    # Failure to follow a point remains UNAVAILABLE, never interpolated or
+    # silently substituted with the MediaPipe joint centre.
+    manual_tracking_warning = ''
+    manual_seeded_tracking = False
+    if calibration is None and manual_points and not manual_only:
+        calibration, manual_tracking_warning = calibration_from_manual_annotations(
+            frames, manual_points, width, height)
+        manual_seeded_tracking = calibration is not None
+        if manual_tracking_warning:
+            print('Manual anchor tracking:', manual_tracking_warning, flush=True)
+    elif calibration is not None and manual_points and not manual_only:
+        existing={calibration.reference_frame,*[a[0] for a in calibration.additional_references]}
+        extra=list(calibration.additional_references)
+        lookup={f.frame:f for f in frames}
+        for i,label in sorted(manual_points.items()):
+            f=lookup.get(i)
+            if (i not in existing and f is not None and
+                    f.side==calibration.side and f.points and f.knee_deg is not None):
+                hx,hy=label.upper_thigh_at_hip;kx,ky=label.top_of_knee
+                extra.append((i,hx,hy,kx,ky))
+                existing.add(i)
+        if len(extra)!=len(calibration.additional_references):
+            calibration=replace(calibration,additional_references=tuple(sorted(extra)))
+            calibration.validate()
     if calibration is not None:
         frames=track_anatomy(video,frames,calibration,width,height)
+    if manual_points:
+        frames=[apply_manual(f,manual_points[f.frame],width,height)
+                if f.frame in manual_points else f for f in frames]
+    # Distinct data flows: joint centre kinetics -> repetition analysis;
+    # anatomical SURFACE tracking/manual annotations -> IPF relative height.
+    measurements=[measure(f,width,height,require_manual_verification=True) for f in frames]
+    measurement_by_frame={m.frame:m for m in measurements}
     result=analyse(frames,config)
     output.mkdir(parents=True,exist_ok=True)
     shots=output/'event_screenshots'
@@ -113,33 +157,27 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
     index_by_frame={p.frame:p for p in frames}
     events=[]
     smoothed_by_frame={f.frame:result.smoothed_crease_depth[i] for i,f in enumerate(frames)}
-    # Compute high-confidence depth maxima independently of knee-angle rep phases.
+    # Peak image-plane surface depth is selected independently of knee angles.
+    # Missing tracked frames are never filled with joint-centre measurements.
+    rep_assessments={a.number:attempt_depth(
+        measurements,a.start_s,a.end_s,a.number,a.outcome=='complete',
+        bottom_time_s=next((e.time_s for e in a.events if e.name=='descent_end'),None))
+        for a in result.attempts}
     rep_depth={}
-    for att in result.attempts:
-        candidates=[f for f in frames if att.start_s<=f.time_s<=att.end_s
-                    and f.crease_to_knee_top_delta is not None
-                    and min(f.hip_crease_tracking_confidence or 0,
-                            f.knee_top_tracking_confidence or 0)>=.5]
-        if candidates:
-            max_frame=max(candidates,key=lambda f:f.crease_to_knee_top_delta)
-            thigh_length=(np.linalg.norm(np.asarray(max_frame.points[1])*[width,height]-
-                                         np.asarray(max_frame.points[2])*[width,height])
-                          if max_frame.points else None)
-            conf=min(max_frame.hip_crease_tracking_confidence,max_frame.knee_top_tracking_confidence)
-            status=classify_depth(max_frame.crease_to_knee_top_delta*height,thigh_length,conf)
-            rep_depth[att.number]={'max_depth_px':round(max_frame.crease_to_knee_top_delta*height,2),
-                    'max_depth_normalized':round(max_frame.crease_to_knee_top_delta*height/thigh_length,4) if thigh_length else None,
-                    'max_depth_frame':max_frame.frame,'max_depth_time_s':round(max_frame.time_s,3),
-                    'max_depth_hip_crease_xy':max_frame.crease_point,
-                    'max_depth_knee_top_xy':max_frame.knee_top_point,
-                    'max_depth_status':status,'max_depth_tracking_confidence':round(conf,3),
-                    'depth_unavailable_reason':''}
-        else:
-            rep_depth[att.number]={'max_depth_px':None,'max_depth_normalized':None,
-                    'max_depth_frame':None,'max_depth_time_s':None,
-                    'max_depth_hip_crease_xy':None,'max_depth_knee_top_xy':None,
-                    'max_depth_status':'unavailable','max_depth_tracking_confidence':0,
-                    'depth_unavailable_reason':'no_confident_anatomical_tracking'}
+    for a in result.attempts:
+        d=rep_assessments[a.number]['depth_assessment']
+        rep_depth[a.number]={
+            'max_depth_px':d['depth_margin_px'],
+            'max_depth_normalized':d['depth_margin_normalized'],
+            'max_depth_frame':d['maximum_depth_frame'],
+            'max_depth_time_s':d['maximum_depth_timestamp_s'],
+            'max_depth_hip_crease_xy':d.get('upper_thigh_at_hip_px'),
+            'max_depth_knee_top_xy':d.get('top_of_knee_px'),
+            'max_depth_status':d['status'].lower(),
+            'max_depth_tracking_confidence':d.get('tracking_quality'),
+            'depth_unavailable_reason':'' if d['status']!=UNAVAILABLE else 'insufficient_surface_observations',
+            'depth_assessment':d,
+        }
     for att in result.attempts:
         for e in att.events:
             event_frame=index_by_frame[e.frame]
@@ -153,17 +191,24 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
                            'crease_minus_knee_top_px':round(event_frame.crease_to_knee_top_delta*height,2)
                                    if event_frame.crease_to_knee_top_delta is not None else None,
                            'crease_minus_knee_top_norm':event_frame.crease_to_knee_top_delta,
-                           'crease_depth_status':classify_depth(smoothed_delta*height if smoothed_delta is not None else None,
-                               np.linalg.norm((np.asarray(event_frame.points[1])-np.asarray(event_frame.points[2]))*[width,height])
-                               if event_frame.points else None,
-                               min(event_frame.hip_crease_tracking_confidence or 0,event_frame.knee_top_tracking_confidence or 0)),
+                           'crease_depth_status':measurement_by_frame[e.frame].depth_status.lower(),
                            'smoothed_crease_minus_knee_top_norm':smoothed_delta,
                            'depth_method':event_frame.depth_tracking_method,
                            'hip_crease_x':event_frame.crease_point[0] if event_frame.crease_point else None,
                            'knee_top_x':event_frame.knee_top_point[0] if event_frame.knee_top_point else None,
                            'hip_crease_tracking_confidence':event_frame.hip_crease_tracking_confidence,
                            'knee_top_tracking_confidence':event_frame.knee_top_tracking_confidence,
-                           'depth_tracking_reason':event_frame.depth_unavailable_reason})
+                           'depth_tracking_reason':event_frame.depth_unavailable_reason,
+                           'measurement_source':measurement_by_frame[e.frame].measurement_source,
+                           'depth_uncertainty_px':measurement_by_frame[e.frame].depth_uncertainty_px})
+    # Add timestamped screenshots for manually annotated frames and peak depths.
+    extra_shots={}
+    for frame_id in manual_points:
+        if frame_id in index_by_frame:
+            extra_shots[frame_id]=f'manual_depth_{frame_id:06d}.png'
+    for d in rep_depth.values():
+        if d['max_depth_frame'] is not None:
+            i=d['max_depth_frame'];extra_shots.setdefault(i,f'peak_depth_{i:06d}.png')
     by_frame:dict[int,list[dict]]={}
     for e in events:
         by_frame.setdefault(e['frame'],[]).append(e)
@@ -187,6 +232,11 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
             annotated=overlay(raw,item,result,label)
             if writer is not None:
                 writer.write(annotated)
+            if item.frame in extra_shots:
+                name=extra_shots[item.frame]
+                folder=output/'depth_screenshots';folder.mkdir(exist_ok=True)
+                if not cv2.imwrite(str(folder/name),annotated):
+                    raise RuntimeError(f'Cannot write depth screenshot: {name}')
             for e in frame_events:
                 # Separate screenshots for multiple events sharing a single frame.
                 image=annotated if e['event']==label else overlay(raw,item,result,e['event'])
@@ -199,7 +249,8 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
             writer.release()
     per_frame=[]
     for i,p in enumerate(frames):
-        per_frame.append({
+        m=measurements[i]
+        per_frame.append({**m.to_dict(),
             'frame':p.frame,'time_s':round(p.time_s,3),
             'knee_deg':p.knee_deg,'hip_deg':p.hip_deg,'hip_y':p.hip_y,
             'knee_y':p.knee_y,'visibility':p.visibility,'side':p.side,
@@ -208,13 +259,11 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
             'crease_x':p.crease_point[0] if p.crease_point else None,
             'crease_y':p.crease_point[1] if p.crease_point else None,
             'knee_top_x':p.knee_top_point[0] if p.knee_top_point else None,
+            'knee_top_surface_x_px':m.knee_top_x,
             'knee_top_y':p.knee_top_point[1] if p.knee_top_point else None,
+            'knee_top_surface_y_px':m.knee_top_y,
             'crease_minus_knee_top_norm':p.crease_to_knee_top_delta,
-            'crease_depth_status':classify_depth(result.smoothed_crease_depth[i]*height
-                if result.smoothed_crease_depth[i] is not None else None,
-                np.linalg.norm((np.asarray(p.points[1])-np.asarray(p.points[2]))*[width,height])
-                if p.points else None,
-                min(p.hip_crease_tracking_confidence or 0,p.knee_top_tracking_confidence or 0)),
+            'crease_depth_status':m.depth_status.lower(),
             'smoothed_crease_minus_knee_top_norm':result.smoothed_crease_depth[i],
             'timestamp_s':p.time_s,
             'hip_crease_x':p.crease_point[0]*width if p.crease_point else None,
@@ -226,9 +275,8 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
                 np.linalg.norm((np.asarray(p.points[1])-np.asarray(p.points[2]))*[width,height]))
                 if p.crease_to_knee_top_delta is not None and p.points and
                    np.linalg.norm((np.asarray(p.points[1])-np.asarray(p.points[2]))*[width,height])>0 else None,
-            'depth_status':classify_depth(p.crease_to_knee_top_delta*height if p.crease_to_knee_top_delta is not None else None,
-                np.linalg.norm((np.asarray(p.points[1])-np.asarray(p.points[2]))*[width,height]) if p.points else None,
-                min(p.hip_crease_tracking_confidence or 0,p.knee_top_tracking_confidence or 0)),
+            'depth_status':m.depth_status.lower(),
+            'ipf_depth_status':m.depth_status,
             'hip_crease_tracking_confidence':p.hip_crease_tracking_confidence,
             'knee_top_tracking_confidence':p.knee_top_tracking_confidence,
             'depth_tracking_method':p.depth_tracking_method,
@@ -253,7 +301,29 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
                 'crease_minus_knee_top_norm','crease_depth_status','depth_method',
                 'smoothed_crease_minus_knee_top_norm','hip_crease_x','knee_top_x',
                 'hip_crease_tracking_confidence','knee_top_tracking_confidence',
-                'depth_tracking_reason'])
+                'depth_tracking_reason','measurement_source','depth_uncertainty_px'])
+    # Diagnose the actual squat bottom, rather than a misleading all-video
+    # percentage. Both anatomical surface points must be present for a depth
+    # observation; a reliable MediaPipe *joint* angle is not sufficient.
+    bottom_tracking_coverage={}
+    for attempt in result.attempts:
+        bottom_event=next((e for e in attempt.events if e.name=='descent_end'),None)
+        if bottom_event is None:
+            continue
+        region=[p for p in frames if abs(p.time_s-bottom_event.time_s)<=.25]
+        available=[p for p in region if p.crease_point is not None and p.knee_top_point is not None]
+        bottom_tracking_coverage[str(attempt.number)]={
+            'bottom_time_s':round(bottom_event.time_s,3),
+            'window_s':0.25,
+            'frames_in_window':len(region),
+            'depth_measurement_frames':len(available),
+            'manual_frames':sum(p.depth_tracking_method in ('MANUAL_ANNOTATION','MANUAL_VERIFIED_TRACKING') for p in available),
+            'optical_flow_frames':sum(p.depth_tracking_method=='local_optical_flow' for p in available),
+            'bottom_frame_has_depth':any(p.frame==bottom_event.frame for p in available),
+            'missing_reasons':dict(Counter(
+                p.depth_unavailable_reason or 'no_anatomical_surface_estimate'
+                for p in region if p.crease_point is None or p.knee_top_point is None)),
+        }
     summary={
         'source':video.name,'resolution':[width,height],'fps':fps,
         'analysed_frames':len(frames),'selected_side':selected_side,
@@ -267,16 +337,32 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
         'inference_ms_per_frame':round(model_s/len(frames)*1000,2),
         'offline_processing_fps':round(len(frames)/elapsed,2),
         'configuration':config.__dict__,
-        'depth_calibration_applied':calibration is not None,
+        'depth_calibration_applied':depth_calibration is not None,
+        'manual_seeded_visual_tracking':manual_seeded_tracking,
+        'manual_tracking_warning':manual_tracking_warning,
+        'manual_annotation_count':len(manual_points),
+        'anatomical_tracking_valid_frames':sum(
+            p.crease_point is not None and p.knee_top_point is not None and
+            p.depth_tracking_method=='local_optical_flow' for p in frames),
+        'anatomical_tracking_unavailable_reasons':dict(Counter(
+            p.depth_unavailable_reason for p in frames
+            if p.depth_tracking_method=='local_optical_flow' and p.crease_point is None)),
+        'bottom_tracking_coverage':bottom_tracking_coverage,
+        'manual_depth_annotations_applied':bool(manual_points),
         'depth_calibration_reference_s':calibration.reference_time_s if calibration else None,
-        'depth_method':calibration.method if calibration else 'not_calibrated',
-        'depth_metric_note':'Manually clicked anatomical surface references are independently tracked via local visual flow; 2D approximate, not validated judging.',
+        'depth_method':('manual_annotation_seeded_optical_flow' if manual_seeded_tracking
+                        else calibration.method if calibration else 'manual_frames_only' if manual_points
+                        else 'not_calibrated'),
+        'depth_metric_note':'Optical-flow margins are provisional and not classified as above/below without manual verification. A missing bottom cannot establish insufficient depth. Signed image-plane pixels, not cm. No official IPF ruling.',
         'per_attempt_depth':rep_depth,
+        'ipf_depth_assessments':list(rep_assessments.values()),
         'warning':result.warning,
         'limitations':'2D view-dependent heuristics; NOT competition-validated depth or failure detection.',
     }
-    if calibration is not None:
+    if calibration is not None or manual_points:
         export_plots(frames,output/'diagnostics',height,width)
+        from squatvision.ipf_plot import plot_depth
+        plot_depth(measurements,output/'depth_vs_time.svg')
     (output/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
     (output/'events.json').write_text(json.dumps(events,indent=2),encoding='utf-8')
     print(json.dumps(summary,indent=2))
@@ -290,9 +376,14 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
 
 
 def main():
-    p=argparse.ArgumentParser(description='SquatVision v3: squat attempts, phases and calibrated depth guides')
-    p.add_argument('--input',required=True,type=Path,help='Input recorded, constant-frame-rate MP4')
-    p.add_argument('--output',type=Path,default=Path('outputs/demo'))
+    p=argparse.ArgumentParser(description='SquatVision v5: squat phases and experimental IPF surface-depth assessment')
+    sources=p.add_mutually_exclusive_group()
+    sources.add_argument('--input',type=Path,default=None,
+                         help='Analyse one recorded MP4 (legacy mode)')
+    sources.add_argument('--input-dir',type=Path,default=None,
+                         help='Analyse every .mp4 in directory (default: data)')
+    p.add_argument('--output',type=Path,default=None,
+                   help='Single-video destination or batch output root (default: outputs)')
     p.add_argument('--model',type=Path,default=Path('models/pose_landmarker_lite.task'))
     p.add_argument('--side',choices=['auto','left','right'],default='auto')
     p.add_argument('--min-visibility',type=float,default=0.55)
@@ -303,6 +394,14 @@ def main():
     p.add_argument('--upright-hold',type=float,default=.30,help='Standing hold in seconds')
     p.add_argument('--lockout-hold',type=float,default=.35,help='Return-to-upright hold in seconds')
     p.add_argument('--no-video',action='store_true',help='Export frames and event screenshots but skip MP4 rendering')
+    p.add_argument('--manual-annotations',type=Path,default=None,
+                   help='Manual depth annotations JSON; also seeds provisional optical flow between labelled frames')
+    p.add_argument('--annotations-dir',type=Path,default=None,
+                   help='Batch: per-video <stem>.json manual annotation files')
+    p.add_argument('--calibrations-dir',type=Path,default=None,
+                   help='Batch: per-video <stem>.json calibration files')
+    p.add_argument('--manual-only',action='store_true',
+                   help='Disable visual tracking between manually marked frames')
     p.add_argument('--depth-calibration',type=Path,default=None,
                    help='Path to JSON created by calibrate_depth.py; required for anatomical depth tracking')
     args=p.parse_args()
@@ -313,8 +412,34 @@ def main():
     config=Config(min_knee_excursion_deg=args.min_knee_excursion,
                   min_hip_drop=args.min_hip_drop,upright_hold_s=args.upright_hold,
                   return_hold_s=args.lockout_hold)
-    run(args.input,args.output,args.model,args.side,config,
-        args.min_visibility,args.start_time,args.end_time,args.no_video,args.depth_calibration)
+    if args.input is not None:
+        if args.annotations_dir is not None or args.calibrations_dir is not None:
+            p.error('--annotations-dir and --calibrations-dir require batch mode.')
+        run(args.input, args.output or Path('outputs/demo'), args.model, args.side, config,
+            args.min_visibility, args.start_time, args.end_time, args.no_video,
+            args.depth_calibration, args.manual_annotations, args.manual_only)
+        return
+    # Without --input, batch process all MP4s directly inside data/.
+    # Separate folders and per-video annotation files prevent camera mixing.
+    if args.manual_annotations is not None or args.depth_calibration is not None:
+        p.error('For batch processing, use --annotations-dir/--calibrations-dir '
+                'containing separate <stem>.json files instead.')
+    batch_input = args.input_dir or Path('data')
+    batch_output = args.output or Path('outputs')
+    try:
+        rows = run_batch(
+            batch_input, batch_output,
+            process_video=lambda video, dest, manual, calibration: run(
+                video, dest, args.model, args.side, config,
+                args.min_visibility, args.start_time, args.end_time, args.no_video,
+                calibration, manual, args.manual_only),
+            annotations_dir=args.annotations_dir,
+            calibrations_dir=args.calibrations_dir,
+        )
+    except BatchInputError as exc:
+        p.error(str(exc))
+    if any(row['status'] == 'failed' for row in rows):
+        raise SystemExit(1)
 
 
 if __name__=='__main__':

@@ -6,7 +6,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 from .analysis import Analysis, FrameMetrics, PhaseEvent
-from .depth import depth_status, classify_depth
+from .depth import depth_status
+from .ipf_depth import measure, UNAVAILABLE, BELOW, ABOVE, AUTOMATED
 
 KNEE_COLOUR = (255, 229, 70)  # Cyan-yellow in OpenCV BGR
 HIP_COLOUR = (68, 164, 255)   # Orange
@@ -62,16 +63,7 @@ def draw_angle_guides(image: np.ndarray, frame: FrameMetrics):
     for (joint,colour) in [(hip,HIP_COLOUR),(knee,KNEE_COLOUR)]:
         cv2.circle(image,joint,6,(30,32,35),1,cv2.LINE_AA)
         cv2.circle(image,joint,3,colour,1,cv2.LINE_AA)
-    # Labels positioned off the joints, inside image bounds. Draw a dark border.
-    for joint,value,colour,xoff,yoff in [(hip,frame.hip_deg,HIP_COLOUR,12,-12),
-                                        (knee,frame.knee_deg,KNEE_COLOUR,12,20)]:
-        if value is None:
-            continue
-        text=f'{value:.0f} deg'
-        x=max(3,min(width-100,joint[0]+xoff))
-        y=max(20,min(height-20,joint[1]+yoff))
-        cv2.putText(image,text,(x,y),cv2.FONT_HERSHEY_SIMPLEX,.55,(0,0,0),4,cv2.LINE_AA)
-        cv2.putText(image,text,(x,y),cv2.FONT_HERSHEY_SIMPLEX,.55,colour,2,cv2.LINE_AA)
+    # Numeric angles live in the HUD to avoid covering the athlete and joints.
 
 
 def timestamp(t: float) -> str:
@@ -80,48 +72,58 @@ def timestamp(t: float) -> str:
     return f'{minutes:02d}:{seconds:06.3f}'
 
 
+def _fitted_text(image: np.ndarray, message: str, y: int,
+                 max_width: int, colour=TEXT, initial_scale: float=.45) -> None:
+    """Fit the full status within narrow source footage (never truncate context)."""
+    scale=initial_scale
+    while scale>.27:
+        (tw,_),_=cv2.getTextSize(message,cv2.FONT_HERSHEY_SIMPLEX,scale,1)
+        if tw<=max_width:break
+        scale-=.02
+    cv2.putText(image,message,(7,y),cv2.FONT_HERSHEY_SIMPLEX,scale,(4,8,12),3,cv2.LINE_AA)
+    cv2.putText(image,message,(7,y),cv2.FONT_HERSHEY_SIMPLEX,scale,colour,1,cv2.LINE_AA)
+
+
 def overlay(frame: np.ndarray, point: FrameMetrics, analysis: Analysis,
             event_label: str | None = None) -> np.ndarray:
     result=frame.copy()
     draw_angle_guides(result,point)
     draw_depth_guides(result,point)
     h,w=result.shape[:2]
-    padding=8
-    panel_h=min(h,166)
-    base=result.copy()
-    cv2.rectangle(base,(0,0),(min(w,610),panel_h),(18,25,32),-1)
-    cv2.addWeighted(base,0.68,result,0.32,0,result)
     completed=sum(a.outcome=='complete' and a.end_s<=point.time_s for a in analysis.attempts)
-    rows=[f'Time {timestamp(point.time_s)} | Reps {completed}',
-          f'Knee {point.knee_deg:.1f} deg | Hip {point.hip_deg:.1f} deg'
-          if point.knee_deg is not None and point.hip_deg is not None else 'Pose unavailable / low confidence',
-          f'Side {point.side or "unknown"} | 2D estimates only']
-    if point.crease_to_knee_top_delta is not None:
-        dy=point.crease_to_knee_top_delta * h
-        length=hypot((point.points[2][0]-point.points[1][0])*w,
-                     (point.points[2][1]-point.points[1][1])*h) if point.points else None
-        conf=min(point.hip_crease_tracking_confidence or 0.,
-                 point.knee_top_tracking_confidence or 0.)
-        label=classify_depth(dy,length,conf).replace('_estimate','').upper().replace('_',' ')
-        rows.append(f'Depth {dy:+.1f}px | {label}')
+    m=measure(point,w,h,require_manual_verification=True)
+    provenance={'MANUAL_ANNOTATION':'MANUAL','MANUAL_VERIFIED_TRACKING':'VERIFIED',
+                'AUTOMATED_TRACKING':'FLOW'}.get(m.measurement_source,'NONE')
+    if m.depth_margin_px is None:
+        lines=[f'{timestamp(point.time_s)}  |  Reps {completed}',
+               'Depth: UNAVAILABLE',
+               'Surface references not reliable']
+    elif m.measurement_source == AUTOMATED:
+        lines=[f'{timestamp(point.time_s)}  |  Reps {completed}',
+               f'Depth proxy: {m.depth_margin_px:+.1f}px (FLOW)',
+               'UNVERIFIED - review bottom frame']
     else:
-        rows.append('Depth: UNAVAILABLE (tracking lost)')
-    if event_label:
-        rows.append(f'EVENT: {event_label.replace("_"," ").upper()}')
-    for i,t in enumerate(rows):
-        font_scale=min(.62,max(.42,w/700))
-        color=(90,230,255) if event_label and i==len(rows)-1 else TEXT
-        cv2.putText(result,t,(padding,24+i*30),cv2.FONT_HERSHEY_SIMPLEX,
-                    font_scale,(0,0,0),3,cv2.LINE_AA)
-        cv2.putText(result,t,(padding,24+i*30),cv2.FONT_HERSHEY_SIMPLEX,
-                    font_scale,color,1,cv2.LINE_AA)
-    # Legend uses the same colours as the angle measurement guides.
-    if h>200:
-        y=h-17
-        cv2.putText(result,'-- hip angle', (12,y),cv2.FONT_HERSHEY_SIMPLEX,.45,HIP_COLOUR,1,cv2.LINE_AA)
-        cv2.putText(result,'-- knee angle',(135,y),cv2.FONT_HERSHEY_SIMPLEX,.45,KNEE_COLOUR,1,cv2.LINE_AA)
-        if point.crease_point is not None:
-            cv2.putText(result,'HC / KT: calibrated estimates',(12,y-20),cv2.FONT_HERSHEY_SIMPLEX,.40,DEPTH_COLOUR,1,cv2.LINE_AA)
+        short={BELOW:'EST. BELOW',ABOVE:'OBS. ABOVE'}.get(m.depth_status,'BORDERLINE')
+        lines=[f'{timestamp(point.time_s)}  |  Reps {completed}',
+               f'IPF surface margin {m.depth_margin_px:+.1f}px',
+               f'{short}  +/-{m.depth_uncertainty_px:.1f}px [{provenance}]']
+    angle_line=(f'Knee {point.knee_deg:.0f} / Hip {point.hip_deg:.0f} deg'
+                if point.knee_deg is not None and point.hip_deg is not None else
+                'Joint angles unavailable')
+    lines.append(angle_line)
+    if event_label:lines.append('EVENT: '+event_label.replace('_',' ').upper())
+    # Compact, fixed-height panel; full strings are font-scaled, not clipped.
+    panel_h=min(h,8+len(lines)*20)
+    dark=result.copy()
+    cv2.rectangle(dark,(0,0),(w,panel_h),(9,17,23),-1)
+    cv2.addWeighted(dark,.85,result,.15,0,result)
+    for i,line in enumerate(lines):
+        tone=(85,220,255) if i==len(lines)-1 and event_label else TEXT
+        _fitted_text(result,line,17+20*i,w-12,tone,.46 if w<=420 else .58)
+    # Small unobtrusive legend below frame content.
+    if h>160:
+        cv2.putText(result,'Orange hip / Cyan knee: joint centres',
+                    (8,h-8),cv2.FONT_HERSHEY_SIMPLEX,.36,(244,244,244),1,cv2.LINE_AA)
     return result
 
 
@@ -136,42 +138,41 @@ DEPTH_REFERENCE_COLOUR = (185, 180, 245)
 
 
 def draw_depth_guides(image: np.ndarray, frame: FrameMetrics):
-    """Dashed horizontal height guides, an offset vertical gap and hollow point rings.
+    """Reference positions with short dashed guides, no anatomy-obscuring labels.
 
-    Keep central pixels of the anatomical reference estimates visible. The
-    displayed positions are tracked by a thigh-anchored calibration, not
-    re-detected anatomy.
+    These pixels visualise anatomical surface estimates, not pose joint centres.
     """
     if frame.crease_point is None or frame.knee_top_point is None:
         return
     height,width=image.shape[:2]
-    crease=(round(frame.crease_point[0]*width),round(frame.crease_point[1]*height))
-    knee_top=(round(frame.knee_top_point[0]*width),round(frame.knee_top_point[1]*height))
-    # Position the measurement bracket to the side, not over the leg.
-    bracket_x=max(15,min(width-16,max(crease[0],knee_top[0])+33))
-    for point,colour in ((crease,DEPTH_COLOUR),(knee_top,DEPTH_REFERENCE_COLOUR)):
-        # Hollow circle and side tick: no filled dot obscuring the surface.
-        cv2.circle(image,point,8,(0,0,0),2,cv2.LINE_AA)
-        cv2.circle(image,point,7,colour,1,cv2.LINE_AA)
-        # Start just beyond the marker rather than drawing across the surface.
-        direction=1 if bracket_x>point[0] else -1
-        pos=point[0]+direction*13
-        while (pos<bracket_x-4 if direction==1 else pos>bracket_x+4):
-            nxt=pos+direction*5
-            if direction==1:
-                nxt=min(nxt,bracket_x-4)
-            else:
-                nxt=max(nxt,bracket_x+4)
-            cv2.line(image,(int(pos),point[1]),(int(nxt),point[1]),colour,2,cv2.LINE_AA)
-            pos=nxt+direction*6
-    if abs(crease[1]-knee_top[1])>=3:
-        # Vertical distance measured separately from joint-angle rays.
-        y0,y1=sorted((crease[1],knee_top[1]))
-        for y in range(y0,y1,11):
-            cv2.line(image,(bracket_x,y),(bracket_x,min(y+5,y1)),DEPTH_COLOUR,2,cv2.LINE_AA)
-    # Short callouts close to points; not on top of the surface being evaluated.
-    for label,point,colour in (('Hip Crease',crease,DEPTH_COLOUR),('Knee Top',knee_top,DEPTH_REFERENCE_COLOUR)):
-        lx=max(2,min(width-99,point[0]-72))
-        ly=max(18,min(height-16,point[1]-12))
-        cv2.putText(image,label,(lx,ly),cv2.FONT_HERSHEY_SIMPLEX,.42,(0,0,0),3,cv2.LINE_AA)
-        cv2.putText(image,label,(lx,ly),cv2.FONT_HERSHEY_SIMPLEX,.42,colour,1,cv2.LINE_AA)
+    hip=(round(frame.crease_point[0]*width),round(frame.crease_point[1]*height))
+    knee=(round(frame.knee_top_point[0]*width),round(frame.knee_top_point[1]*height))
+    if not all(0<=p[0]<width and 0<=p[1]<height for p in (hip,knee)):
+        return
+    # Dashed knee-height marker local to the knee, not across the whole screen.
+    y=knee[1]
+    for begin,end in ((max(0,knee[0]-85),max(0,knee[0]-12)),
+                      (min(width-1,knee[0]+12),min(width-1,knee[0]+45))):
+        for x in range(begin,end,11):
+            cv2.line(image,(x,y),(min(x+5,end),y),DEPTH_REFERENCE_COLOUR,1,cv2.LINE_AA)
+    # Bracket positioned alongside the reference points, not on the hip/knee.
+    bracket_x=min(width-10,max(hip[0],knee[0])+23)
+    for (x,yy),col in ((hip,DEPTH_COLOUR),(knee,DEPTH_REFERENCE_COLOUR)):
+        cv2.circle(image,(x,yy),6,(15,15,15),2,cv2.LINE_AA)
+        cv2.circle(image,(x,yy),5,col,1,cv2.LINE_AA)
+        direction=1 if bracket_x>x else -1
+        xx=x+direction*9
+        while (xx<bracket_x-5 if direction>0 else xx>bracket_x+5):
+            endx=xx+direction*4
+            cv2.line(image,(xx,yy),(endx,yy),col,1,cv2.LINE_AA)
+            xx+=direction*10
+    if abs(hip[1]-knee[1])>3:
+        lo,hi=sorted([hip[1],knee[1]])
+        for yy in range(lo,hi,10):
+            cv2.line(image,(bracket_x,yy),(bracket_x,min(yy+5,hi)),DEPTH_COLOUR,1,cv2.LINE_AA)
+    # Tiny point identifiers without misleading joint-angle labels.
+    for title,point,col in [('H',hip,DEPTH_COLOUR),('K',knee,DEPTH_REFERENCE_COLOUR)]:
+        xx=point[0]-18 if point[0]>35 else point[0]+9
+        yy=max(100,min(height-8,point[1]-9))
+        cv2.putText(image,title,(xx,yy),cv2.FONT_HERSHEY_SIMPLEX,.4,(0,0,0),3,cv2.LINE_AA)
+        cv2.putText(image,title,(xx,yy),cv2.FONT_HERSHEY_SIMPLEX,.4,col,1,cv2.LINE_AA)

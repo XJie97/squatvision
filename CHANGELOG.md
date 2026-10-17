@@ -1,5 +1,20 @@
 # SquatVision changelog
 
+## v5 — Experimental IPF surface-depth and manual fallback
+
+- Added `squatvision/ipf_depth.py` for independent surface-height comparison,
+  signed/normalised margin, explicit measurement provenance, engineering uncertainty.
+- Added `manual_depth.py` for source-frame manual annotations, editing,
+  zoom controls, CSV/JSON, screenshots, independent of MediaPipe or optical flow.
+- Added `squatvision/ipf_plot.py` with missing-tracking gaps and manual points.
+- Integrated annotations and manual-anchor recovery into `app.py`.
+- Updated portrait-video depth overlays and fixed-position knee-height reference line.
+- Added 15 regression and end-to-end tests, preserving v4's 26 original tests.
+- Preserved phase screenshots, repetition detection and legacy output columns.
+
+**Not an official IPF depth determination.**
+# SquatVision changelog
+
 ## 3.0.0 — 2026-10-18
 
 - Added optional manual hip-crease and knee-top reference point calibration.
@@ -37,3 +52,14 @@
 - Detected an additional visual optical-flow failure on the actual footage: high-confidence background attachment near the knee and low-texture loss near the hip reference.
 - Added a stronger pose-motion gate and multiple manually clicked reference points for reinitialisation, as well as a short-clip sequential grayscale cache.
 - MediaPipe and its model are unavailable in this sandbox; see `REAL_VIDEO_VALIDATION.md` for exactly what was and was not verified.
+
+## v5.2 — 2026-10-18
+- Prevent provisional optical-flow measurements from being labelled EST. ABOVE
+  or EST. BELOW in normal video reports.
+- Do not infer whole-repetition insufficient depth from an early measurement
+  when tracking fails near the bottom.
+- Make manually annotated below-threshold frames separately identifiable.
+- Compact 352px portrait overlays; avoid full-width knee lines and on-leg
+  angle text; maintain angle guides and event timestamps.
+- Mark diagnostic optical-flow graph traces explicitly UNVERIFIED.
+- Add tracking-loss and sparse-manual-coverage regression tests.

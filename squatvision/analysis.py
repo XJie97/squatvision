@@ -29,6 +29,8 @@ class FrameMetrics:
     knee_top_tracking_confidence: Optional[float] = None
     depth_tracking_method: str = "not_calibrated"
     depth_unavailable_reason: str = ""
+    manual_uncertainty_px: Optional[float] = None
+    measurement_source: str = ""
 
     @property
     def depth_delta(self) -> Optional[float]:

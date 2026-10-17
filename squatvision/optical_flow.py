@@ -87,12 +87,29 @@ class LocalPointTracker:
         if len(kept)<6:
             self._lose('insufficient_inlier_features',gray)
             return
-        self.xy=candidate.astype(np.float32)
-        self.features=kept.astype(np.float32)
-        self.confidence=float(min(1.,len(kept)/14) * min(1.,len(kept)/len(p0)))
-        if self.confidence < .4:
+        # Confidence must reflect *track quality*, not an arbitrary target
+        # count of 14 features. A low-texture shorts/hip ROI can contain just
+        # six coherent corners. Previously 6/14 = 0.429 passed the tracker's
+        # 0.4 threshold but failed track_anatomy's 0.5 export threshold,
+        # making the hip marker disappear immediately after a good manual
+        # annotation (confirmed in the real squat at 72.724 -> 72.758 s).
+        # Require >=6 robust inliers, high retention, and low forward/backward
+        # error. This is motion quality, NOT anatomical certainty.
+        n=len(kept)
+        retention=n/max(1,len(p0))
+        median_fb=float(np.median(errors[good][inliers]))
+        # Six features are enough to estimate stable local motion but offer
+        # less redundancy than a highly textured ROI. 0.65 is a *heuristic*
+        # initial support score, not a probability of anatomical accuracy.
+        support=min(1.0,0.65+0.035*max(0,n-6))
+        fb_quality=max(0.0,1.0-median_fb/3.0)
+        quality=float(support*np.sqrt(retention)*fb_quality)
+        if quality < .5:
             self._lose('tracking_confidence_low',gray)
             return
+        self.xy=candidate.astype(np.float32)
+        self.features=kept.astype(np.float32)
+        self.confidence=quality
         self.prev=gray
         self.steps+=1
 
@@ -224,3 +241,49 @@ def track_anatomy(video: Path, frames: list[FrameMetrics], cal: DepthCalibration
         return [result[f.frame] for f in frames]
     finally:
         cap.release()
+
+
+def calibration_from_manual_annotations(
+    frames: list[FrameMetrics],
+    manual_points: dict[int, object],
+    width: int,
+    height: int,
+) -> tuple[DepthCalibration | None, str]:
+    """Build a transient flow calibration from reviewed manual surface labels.
+
+    This runs ONLY for anatomically labelled frames where the matching selected
+    MediaPipe body side and joints are available. The calibration is not written
+    to disk; the original manual JSON remains the canonical annotations.
+
+    No calibration is fabricated when manual anchors fail geometric validation.
+    """
+    lookup={f.frame:f for f in frames}
+    accepted=[]
+    rejected=[]
+    for i, label in sorted(manual_points.items()):
+        frame=lookup.get(i)
+        if frame is None:
+            continue
+        if not frame.points or frame.side not in ('left','right') or frame.knee_deg is None:
+            rejected.append(f'{i}: no matching pose')
+            continue
+        try:
+            cal=DepthCalibration.from_reference(
+                frame, label.upper_thigh_at_hip, label.top_of_knee, width, height)
+        except ValueError as exc:
+            rejected.append(f'{i}: {exc}')
+            continue
+        accepted.append((i,label,cal))
+    if not accepted:
+        return None, ('No usable manual anchors within the analysed video window. '
+                      'Manually annotated frames remain visible; other frames are '
+                      'unavailable. ' + '; '.join(rejected[:3]))
+    first=accepted[0][2]
+    candidates=[(i,lab) for i,lab,_ in accepted if lab is not accepted[0][1]]
+    anchors=tuple((i,*lab.upper_thigh_at_hip,*lab.top_of_knee)
+                  for i,lab in candidates if lookup[i].side==first.side)
+    cal=replace(first,additional_references=anchors)
+    cal.validate()
+    warning=(f'{len(accepted)} manual anchors available; visual flow is provisional. '
+             f'{len(rejected)} rejected anchor(s).' if rejected else '')
+    return cal, warning

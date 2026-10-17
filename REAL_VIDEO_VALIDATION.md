@@ -1,30 +1,66 @@
-# SquatVision v4: real-footage inspection status
+# Real-video verification and limitations — v5
 
-## Source inspected
+## Inputs inspected
 
-- Original: `squat.mp4` (user-supplied Library recording, **not redistributed**).
-- Resolution: 352 × 640 (portrait); approximately 29.99 FPS, 2,862 frames.
-- Analysis target: approximately 70–76 seconds; previous run found one complete squat.
-- Previous calibration frame: ~71.49 s (frame 2144), right side.
-- Previous manual point selections: hip crease (128,274), knee top (202,329), **in original-video pixels**.
+The original user-owned `squat.mp4` was available in the execution environment.
+Metadata observed: **352×640**, **29.990 FPS**, **2862 frames**. The squat is
+approximately within **70–76 seconds**; the v4 report identifies one complete
+repetition, bottom around **72.758 seconds**.
 
-## Confirmed by inspection and isolated optical-flow experiment
+Frames from 71.49, 72.30, 72.75, 73.00, 73.40 and 73.60 seconds were reviewed.
+The visible shorts obscure the exact thigh-at-hip skin surface in some frames.
+A pose-derived or automatically followed marker must not be treated as ground truth.
 
-- The athlete's hip and knee positions move substantially during descent and ascent; an anatomical marker stationary in image X is wrong.
-- A first version of the *visual-only* LK tracker was not sufficient. The hip-reference feature group lost inliers when tracking away from the calibration frame. The knee-reference feature group remained nearly fixed at (202,330) through frames where the visible knee had moved: the flow had attached to background or an unrelated textured region. High LK consistency is **not** proof of anatomical correctness.
-- The local flow implementation was therefore changed to compare each independently tracked point with a **coarse joint-motion expectation** from the existing MediaPipe pose stream, using a relatively tight pose-consistency gate. The pose does **not** supply replacement anatomical point coordinates. Inconsistent flow must become unavailable. Separately labelled keyframes support legitimate manual recovery after tracking loss.
-- Short clips use a sequential grayscale frame cache rather than repeated video seeking.
+## What was actually executed
 
-## Not yet verified
+- `python -m unittest discover -s tests -v`: **41 tests passed** (26 original + 15 new).
+- Ran independent `manual_depth.py --no-gui` against the **actual original video**
+  using the previously supplied *calibration selection* at ~71.490s:
+  upper-thigh=(128,274), top-of-knee=(202,329) in original pixels.
+- The manual-only tool generated valid JSON, CSV and a screenshot with the
+  **arithmetic margin = -55 px**, as expected from these particular selections.
 
-This environment can decode the original MP4 with OpenCV, but does not have MediaPipe installed and cannot access the package/model distribution over the network. Therefore the fully integrated MediaPipe + optical-flow results, measured pixel errors versus manually labelled anatomical landmarks, the final one-rep count under v4 and the depth estimate **have not been verified on the actual footage here**.
+**This is not the maximum depth.** The tested frame predates the bottom; the
+calibration selections are not verified ground-truth anatomical landmarks, and
+this arithmetic check cannot determine whether the lift reached IPF depth.
 
-No competition-depth verdict has been calculated. The validated synthetic regressions test two-dimensional X/Y motion, missing data, multiple manual anchors and unchanged event exports; they are not evidence of actual anatomical precision.
+## What was not verified
 
-## How to finish real validation on the user's computer
+- Full MediaPipe inference on the original 64–80-second clip could not run in
+  the execution environment because `mediapipe` was unavailable.
+- No independently validated sequence of actual anatomical surface-point
+  labels was provided for the bottom; quantitative mean/max localisation
+  errors, tracking availability with v5, and threshold-agreement statistics
+  therefore **cannot yet be reported**.
+- All v5 flow-based improvements are structural (extra independent verified
+  manual anchors) rather than a proven increase in accuracy on this clip.
 
-1. Recalibrate the original source at 71.49s in v4. The old v3 JSON lacks exact clicked point coordinates.
-2. Run the 64–80s segment. Inspect screenshots and `diagnostics/*.svg`, particularly X displacement and confidence gaps.
-3. Label at least 5–10 frames (standing, early descent, bottom, ascent, lockout) **from the original MP4**, not an already annotated render.
-4. Compare actual manually clicked X/Y references against `frames.csv` using `validate_depth.py` and report errors and coverage. If optical flow loses the correct anatomical feature, add a new manual calibration keyframe and repeat.
-5. Only treat the output as an **informational 2D depth estimate**, regardless of a positive signed depth difference.
+## Required remaining video validation
+
+1. Install dependencies and run the existing v4 pose pipeline on the 64–80s window.
+2. Manually label several frames across approximately 72–74 seconds in
+   `manual_depth.py`, including the deepest **relative surface** position.
+3. Compare those independently selected coordinates against the automatic
+   tracker with `validate_depth.py`, reporting mean/max error, tracking
+   availability and margin error. Do not relabel failed automatic frames as
+   ground truth.
+4. Inspect `depth_vs_time.svg` for long gaps and implausible jumps and use
+   manual measurements where automated tracking remains invalid.
+5. Compare classification only on reliable reviewed frames. Without the full
+   anatomical surface being visible, an uncertain result is appropriate.
+
+## v5.2 review of user-supplied `annotated(3).mp4`
+
+The uploaded 16-second clip covers approximately 64–80 seconds of the original
+squat. Inspection at source-relative 6.0, 7.0, 8.0, 8.75, 9.3, 10 and 11
+seconds shows that optical-flow depth is intermittent. A numerical margin
+around 72 seconds is followed by **UNAVAILABLE** near the reported bottom
+around 72.758 seconds. Consequently, the earlier **EST. ABOVE** label was
+not defensible as a conclusion about the entire repetition.
+
+v5.2 was tested by automated regression tests, not by rerunning its complete
+MediaPipe analysis on this video. The MediaPipe package and model are absent
+from this environment. The underlying anatomy is partly concealed by clothing,
+and no independently reviewed bottom-position surface labels were supplied.
+No numeric IPF depth margin for the full squat, localisation error or
+competition outcome has been validated.

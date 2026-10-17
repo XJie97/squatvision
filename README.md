@@ -1,3 +1,178 @@
+# SquatVision v5 — IPF Surface-Depth Assessment (Experimental)
+
+**This is the v4-to-v5 extension.** Existing MediaPipe joint-centre angle measurements,
+repetition state machine, movement-phase screenshots, optical-flow tracking and
+other v4 features remain supported.
+
+**Not an IPF-certified judging system.** The IPF squat rule compares the *top of the
+thigh at the hip joint* against the *top of the knee*. Neither point is equivalent
+to MediaPipe's hip/knee joint centre; the knee or hip angle alone does not determine
+competition depth. Camera perspective, shorts, lighting, occlusions, surface point
+ambiguity and foreshortening remain limitations.
+
+## What's new in v5
+
+- Independent **IPF anatomical surface-depth** calculations (never replace these with joint centres).
+- Signed image-plane margin: `hip_surface_y_px - knee_top_y_px` (positive is below).
+- Projected-thigh-normalised ratio, **only when valid MediaPipe joint landmarks** are
+  available for the projected hip-to-knee segment length. Neither metric is centimetres.
+- Explicit measurement provenance: `AUTOMATED_TRACKING`, `MANUAL_ANNOTATION`,
+  `MANUAL_VERIFIED_TRACKING`, or `NONE` when unmeasurable.
+- Explicit four-way classifications: `ESTIMATED_BELOW_DEPTH_THRESHOLD`,
+  `ESTIMATED_ABOVE_DEPTH_THRESHOLD`, `BORDERLINE_UNCERTAIN`, `UNAVAILABLE`.
+- User-configured positive error bound for manual point placement (default ±6 px),
+  and conservative heuristic error bound for automated tracking (8 px baseline plus
+  a tracking-quality penalty). **These are assumed engineering tolerances, not calibrated
+  confidence intervals.** Near-zero margins must be treated as uncertain.
+- Manual frame-by-frame fallback even with no reliable optical-flow tracking;
+  annotating multiple frames near the bottom is recommended. Manual frames may
+  serve as verified additional optical-flow anchors when a valid pose exists.
+- Depth-vs-time SVG, explicit gaps for unavailable automatic observations, manual
+  annotation markers and engineering error bars.
+- A new depth status readout on annotated portrait videos, knee-height reference
+  guide, annotated peak-depth and manual frame screenshots.
+- Extended outputs: `ipf_depth_assessments` in `summary.json`, independent margin and
+  uncertainty fields in `frames.csv`, and manual depth results in JSON and CSV.
+
+## Quick start on Windows PowerShell
+
+From the extracted repository root, using **Python 3.11/3.12**:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python download_model.py
+python -m unittest discover -s tests -v
+```
+
+If you already have v4 installed, you only need to update the source files and
+rerun the tests. Video, model and calibration files are not bundled.
+
+### A. Manually assess the actual squat bottom (works without MediaPipe)
+
+```powershell
+python manual_depth.py --input data/squat.mp4 --output data/manual_depth.json --start-time 72 --end-time 74 --uncertainty-px 8
+```
+
+Interactive controls:
+
+| Action | Control |
+|---|---|
+| Previous/next frame | A / D |
+| Move 10 frames | J / L |
+| Select anatomical references | Left-click the top of thigh at hip joint, then top of knee |
+| Correct current frame | Click again to replace its two selected points |
+| Clear label for current frame | R or right mouse button |
+| Zoom | + / - |
+| Save annotations and screenshots | S |
+| Exit review | Esc (current annotations are still saved) |
+
+Review several frames in the bottom region rather than treating the minimum
+knee-angle frame as maximum anatomical depth. The user may not be able to identify
+the exact skin boundary under clothing. In that case increase the stated marking
+uncertainty or mark the point unavailable; do not invent a precise reference.
+
+You can also insert a manual annotation without a GUI (use actual source-frame pixel
+coordinates; the following values are **placeholders**, not judging data):
+
+```powershell
+python manual_depth.py --input data/squat.mp4 --output data/manual_depth.json --no-gui --point FRAME,HIP_X,HIP_Y,KNEE_X,KNEE_Y
+```
+
+Manual-only exports next to the JSON file:
+`manual_depth_results.csv`, `manual_depth_results.json`,
+`manual_depth_vs_time.svg`, and `manual_depth_screenshots/*.png`.
+A normalised margin is intentionally unavailable here because no joint-centre
+thigh-length reference is inferred. The signed pixel margin still works.
+
+### B. Combine manual labels with the existing v4 analysis
+
+```powershell
+python app.py --input data/squat.mp4 --output outputs/v5_manual --side right --start-time 64 --end-time 80 --min-visibility 0.30 --manual-annotations data/manual_depth.json
+```
+
+This works even when all optical-flow observations are missing. The existing
+MediaPipe model remains required for the main app's **repetition detection**, but
+not for `manual_depth.py`'s independent anatomical-depth assessment.
+
+### C. Automated flow plus manual anchors (recommended when usable)
+
+```powershell
+python app.py --input data/squat.mp4 --output outputs/v5_combined --side right --start-time 64 --end-time 80 --min-visibility 0.30 --depth-calibration depth_calibration_v4.json --manual-annotations data/manual_depth.json
+```
+
+You can also use `--depth-calibration depth_calibration_v4.json` without manual
+labels, but in the reference recording this can report `UNAVAILABLE` around the
+bottom. The application **does not fabricate a valid measurement** in that case.
+
+## IPF depth math and classification
+
+Image Y increases downward. At an annotated or reliably tracked frame:
+
+```text
+margin_px = upper_thigh_at_hip_y_px - knee_top_y_px
+normalised_margin = margin_px / projected_hip_joint_to_knee_joint_length_px
+```
+
+The projected length uses pose joint centres **only as a scale reference**, never
+as a substitute for the surface heights. If joint pose is missing, normalised
+margin is blank, but manual signed pixel depth is still available.
+
+- Margin greater than +assumed uncertainty: `ESTIMATED_BELOW_DEPTH_THRESHOLD`.
+- Margin less than -assumed uncertainty: `ESTIMATED_ABOVE_DEPTH_THRESHOLD`.
+- Margin within the ±assumed uncertainty band: `BORDERLINE_UNCERTAIN`.
+- Missing or unreliable reference points: `UNAVAILABLE`.
+
+For each repetition, the maximum is computed from the **highest observed signed
+margin**, independent of the minimum knee angle. Tracking gaps are not interpolated.
+If the result is 'above', this describes the **best available observed frame**;
+unobserved frames may conceal a deeper position. It cannot prove a competition
+failure. Similarly 'below' is an estimated 2D result, not an official ruling.
+
+## Main outputs
+
+```text
+outputs/v5_combined/
+├── annotated.mp4
+├── frames.csv
+├── attempts.csv
+├── events.csv
+├── events.json
+├── summary.json                 # includes ipf_depth_assessments
+├── depth_vs_time.svg            # with missing data shown as gaps
+├── event_screenshots/          # all existing movement phases
+├── depth_screenshots/          # manually labelled / maximum-depth frames
+└── diagnostics/                # original v4 trajectory plots
+```
+
+New per-frame fields include `upper_thigh_at_hip_x/y`,
+`knee_top_surface_x_px/y_px`, `depth_margin_px`, `depth_margin_normalized`,
+`ipf_depth_status`, `depth_uncertainty_px`, `measurement_source`,
+`tracking_quality`, and `unavailable_reason`. Existing v4 `knee_top_x/y` fields
+retain their **normalised** coordinates for compatibility. Original legacy
+`depth_status`/`crease_depth_status` columns are retained in lowercase; use the
+new `ipf_depth_status` for the four explicit assessment classifications.
+
+## How to validate accuracy against manually labelled frames
+
+Run `validate_depth.py` with manually verified reference annotations. Report
+mean/max localisation error, depth-margin error, valid tracking fraction, and
+threshold agreement on **independent** labels. An accepted calibration does not
+prove tracked anatomical accuracy. See `REAL_VIDEO_VALIDATION.md` for the reference
+clip's observed limitations.
+
+## Privacy and scope
+
+- Keep original gym videos private unless everyone shown has permitted disclosure.
+- The `.gitignore` excludes `data/`, `models/`, `outputs/`, video formats, and `depth_calibration*.json`; inspect `git status` before publishing calibration JSON.
+- Do not use these estimates for official IPF judging, medical decisions or
+  injury-risk claims.
+
+---
+
+## Original v4 documentation
+
 # SquatVision
 
 **Video-based squat analysis with independent hip-crease-to-knee-top depth tracking, using Python, MediaPipe and OpenCV.**
@@ -362,3 +537,59 @@ This reports per-point Euclidean errors, depth difference error and measurement 
 Regression tests include independent horizontal/vertical trajectories with changing signed depth, insufficient visual texture, incorrect body side, persistence of phase/event exports, calibration JSON compatibility, and missing-data handling. These are **synthetic software tests**. The original workout footage was not supplied in the current execution environment; real anatomical error, actual squat depth and true rep count must be checked on the user's source recording.
 
 **Real recording diagnostic note:** On the supplied original video, isolated texture-only flow was found to stick to a static region near the knee and lose the hip region. v4 includes a pose-motion gate to reject such outcomes rather than showing incorrect anatomical measurements. The final pose-guided tracker still requires evaluation with MediaPipe on the original file; see [`REAL_VIDEO_VALIDATION.md`](REAL_VIDEO_VALIDATION.md) for a precise validation status.
+
+## v5.2 depth-reporting correction (important)
+
+The earlier annotated clip reported **EST. ABOVE** from optical-flow positions
+before losing the hip and knee surface tracking at the squat bottom. That was
+not a valid full-repetition conclusion. v5.2 deliberately distinguishes:
+
+- **FLOW / UNVERIFIED:** Optical-flow coordinates and a provisional pixel margin
+  are available. The overlay no longer calls these IPF-compliant/non-compliant.
+- **UNAVAILABLE:** Optical flow lost one or both surface points. No margin is
+  shown on the affected frame. Missing data must not be counted as an above-depth
+  result.
+- **MANUAL / VERIFIED:** Both visible surface points were selected or verified
+  against the *original, unannotated video* at that exact frame. A signed margin
+  and user-chosen error tolerance are reported for that observation.
+- **Attempt summary:** A sparse negative observation (even a manual one) is
+  **not** a sufficient basis to declare the whole rep above required depth.
+  If at least one manually annotated frame is confidently below threshold, the
+  summary says **estimated below at an observed frame**, never an official ruling.
+
+A numeric optical-flow margin can remain in `frames.csv` and `depth_vs_time.svg`
+for debugging; it is **unverified**, regardless of apparent tracking confidence.
+This is a conservative change, not a claim that the anatomical tracker now
+operates reliably throughout the squat.
+
+### Recommended procedure for this footage
+
+Do not choose the initial standing or early descent frame as the sole depth
+reference. Inspect several source frames around the previously detected bottom
+(`72.758 s`), especially near `72.5–73.3 s`. The actual maximum relative
+**surface** depth need not exactly match the knee-angle minimum.
+
+```powershell
+python manual_depth.py --input data/squat.mp4 --output data/manual_depth.json --start-time 72.5 --end-time 73.3 --uncertainty-px 8
+```
+
+Left-click the visible upper thigh at the hip, then the actual top-of-knee
+surface. Repeat on several nearby frames using A/D (one frame) or J/L (ten
+frames). **S** or **Enter** saves; **Esc** or the window X cancels. If clothing,
+viewpoint or occlusion prevents either reference from being located, do not
+invent a point; leave that frame unlabelled.
+
+```powershell
+python app.py --input data/squat.mp4 --output outputs/v52_review --side right --start-time 64 --end-time 80 --min-visibility 0.30 --manual-annotations data/manual_depth.json
+```
+
+Optionally append `--depth-calibration depth_calibration_v4.json` for
+**provisional** optical-flow tracing; only manually reviewed frames are treated
+as anatomical evidence for above/below status. The annotated video keeps the
+angle guides but shows a shorter knee-height reference line, compact HUD and
+no numerical angle labels over the thigh.
+
+IPF depth is defined by the upper surface of the thigh at the hip compared
+with the top of the knee. The visible shorts boundary is not necessarily the
+underlying anatomical surface. A 2D view, manually chosen points and an
+8-pixel tolerance are not validated competition judging.
