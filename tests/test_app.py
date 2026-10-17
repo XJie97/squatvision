@@ -13,6 +13,7 @@ import numpy as np
 
 import app
 from squatvision.analysis import Config, FrameMetrics
+from squatvision.depth import DepthCalibration
 from test_analysis import base_squat, create_video_sequence
 
 
@@ -76,6 +77,34 @@ class TestExports(unittest.TestCase):
                 self.assertTrue(image.exists(), f'Missing {image}')
                 self.assertIsNotNone(cv2.imread(str(image)))
                 self.assertGreater(float(e['timestamp_s']),0.)
+            # Regression: a calibrated run must annotate each critical-position
+            # capture and include independent depth data in event CSV/JSON.
+            reference=decorated[0]
+            calibration=DepthCalibration.from_reference(
+                reference, (reference.points[1][0]*320+8,reference.points[1][1]*480+14),
+                (reference.points[2][0]*320-8,reference.points[2][1]*480-14),
+                320,480)
+            calibration_path=directory/'depth_calibration.json'
+            calibration.save(calibration_path)
+            calibrated_output=directory/'calibrated'
+            with patch.dict(sys.modules, {'mediapipe':fake_mp}), \
+                 patch.object(app,'extract_frame',side_effect=fake_extract):
+                app.run(input_video,calibrated_output,model,'auto',Config(),.55,0.,None,
+                        False,calibration_path)
+            calibrated=json.loads((calibrated_output/'summary.json').read_text())
+            self.assertTrue(calibrated['depth_calibration_applied'])
+            with (calibrated_output/'events.csv').open() as f:
+                calibrated_events=list(csv.DictReader(f))
+            self.assertEqual(len(calibrated_events),4)
+            for event in calibrated_events:
+                self.assertNotEqual(event['crease_minus_knee_top_px'],'')
+                self.assertNotEqual(event['crease_depth_status'],'unavailable')
+                self.assertEqual(event['depth_method'],'manually_calibrated_thigh_attached')
+                self.assertTrue((calibrated_output/event['image']).is_file())
+            with (calibrated_output/'frames.csv').open() as f:
+                rows=list(csv.DictReader(f))
+            self.assertTrue(all(row['crease_y'] and row['knee_top_y'] for row in rows))
+            self.assertNotIn('depth_calibration.json', [p.name for p in calibrated_output.iterdir()])
 
 
 if __name__=='__main__':

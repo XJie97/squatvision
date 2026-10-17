@@ -6,6 +6,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from .analysis import Analysis, FrameMetrics, PhaseEvent
+from .depth import depth_status
 
 KNEE_COLOUR = (255, 229, 70)  # Cyan-yellow in OpenCV BGR
 HIP_COLOUR = (68, 164, 255)   # Orange
@@ -83,9 +84,10 @@ def overlay(frame: np.ndarray, point: FrameMetrics, analysis: Analysis,
             event_label: str | None = None) -> np.ndarray:
     result=frame.copy()
     draw_angle_guides(result,point)
+    draw_depth_guides(result,point)
     h,w=result.shape[:2]
     padding=8
-    panel_h=min(h,145)
+    panel_h=min(h,166)
     base=result.copy()
     cv2.rectangle(base,(0,0),(min(w,610),panel_h),(18,25,32),-1)
     cv2.addWeighted(base,0.68,result,0.32,0,result)
@@ -94,11 +96,20 @@ def overlay(frame: np.ndarray, point: FrameMetrics, analysis: Analysis,
           f'Knee {point.knee_deg:.1f} deg | Hip {point.hip_deg:.1f} deg'
           if point.knee_deg is not None and point.hip_deg is not None else 'Pose unavailable / low confidence',
           f'Side {point.side or "unknown"} | 2D estimates only']
+    if point.crease_to_knee_top_delta is not None:
+        from .depth import depth_status
+        dy=point.crease_to_knee_top_delta * h
+        label={'crease_below_knee_top':'BELOW',
+               'crease_above_knee_top':'ABOVE',
+               'near_level_uncertain':'NEAR LEVEL'}[depth_status(point.crease_to_knee_top_delta)]
+        rows.append(f'Crease-knee top: {dy:+.1f}px | {label}*')
+    else:
+        rows.append('Crease-knee top: NOT CALIBRATED')
     if event_label:
         rows.append(f'EVENT: {event_label.replace("_"," ").upper()}')
     for i,t in enumerate(rows):
         font_scale=min(.62,max(.42,w/700))
-        color=(90,230,255) if i==3 else TEXT
+        color=(90,230,255) if event_label and i==len(rows)-1 else TEXT
         cv2.putText(result,t,(padding,24+i*30),cv2.FONT_HERSHEY_SIMPLEX,
                     font_scale,(0,0,0),3,cv2.LINE_AA)
         cv2.putText(result,t,(padding,24+i*30),cv2.FONT_HERSHEY_SIMPLEX,
@@ -108,9 +119,58 @@ def overlay(frame: np.ndarray, point: FrameMetrics, analysis: Analysis,
         y=h-17
         cv2.putText(result,'-- hip angle', (12,y),cv2.FONT_HERSHEY_SIMPLEX,.45,HIP_COLOUR,1,cv2.LINE_AA)
         cv2.putText(result,'-- knee angle',(135,y),cv2.FONT_HERSHEY_SIMPLEX,.45,KNEE_COLOUR,1,cv2.LINE_AA)
+        if point.crease_point is not None:
+            cv2.putText(result,'HC / KT: calibrated estimates',(12,y-20),cv2.FONT_HERSHEY_SIMPLEX,.40,DEPTH_COLOUR,1,cv2.LINE_AA)
     return result
 
 
 def screenshot_name(attempt: int, event: PhaseEvent) -> str:
     stamp=f'{event.time_s:010.3f}'.replace('.','p')
     return f'attempt_{attempt:02d}_{event.name}_{stamp}s.png'
+
+# Depth overlay uses independent anatomical reference-point *estimates*.
+# NEVER label MediaPipe hip/knee joint centres as the top hip crease/knee surface.
+DEPTH_COLOUR = (95, 215, 105)  # Green for calibrated depth measurement
+DEPTH_REFERENCE_COLOUR = (185, 180, 245)
+
+
+def draw_depth_guides(image: np.ndarray, frame: FrameMetrics):
+    """Dashed horizontal height guides, an offset vertical gap and hollow point rings.
+
+    Keep central pixels of the anatomical reference estimates visible. The
+    displayed positions are tracked by a thigh-anchored calibration, not
+    re-detected anatomy.
+    """
+    if frame.crease_point is None or frame.knee_top_point is None:
+        return
+    height,width=image.shape[:2]
+    crease=(round(frame.crease_point[0]*width),round(frame.crease_point[1]*height))
+    knee_top=(round(frame.knee_top_point[0]*width),round(frame.knee_top_point[1]*height))
+    # Position the measurement bracket to the side, not over the leg.
+    bracket_x=max(15,min(width-16,max(crease[0],knee_top[0])+33))
+    for point,colour in ((crease,DEPTH_COLOUR),(knee_top,DEPTH_REFERENCE_COLOUR)):
+        # Hollow circle and side tick: no filled dot obscuring the surface.
+        cv2.circle(image,point,8,(0,0,0),2,cv2.LINE_AA)
+        cv2.circle(image,point,7,colour,1,cv2.LINE_AA)
+        # Start just beyond the marker rather than drawing across the surface.
+        direction=1 if bracket_x>point[0] else -1
+        pos=point[0]+direction*13
+        while (pos<bracket_x-4 if direction==1 else pos>bracket_x+4):
+            nxt=pos+direction*5
+            if direction==1:
+                nxt=min(nxt,bracket_x-4)
+            else:
+                nxt=max(nxt,bracket_x+4)
+            cv2.line(image,(int(pos),point[1]),(int(nxt),point[1]),colour,2,cv2.LINE_AA)
+            pos=nxt+direction*6
+    if abs(crease[1]-knee_top[1])>=3:
+        # Vertical distance measured separately from joint-angle rays.
+        y0,y1=sorted((crease[1],knee_top[1]))
+        for y in range(y0,y1,11):
+            cv2.line(image,(bracket_x,y),(bracket_x,min(y+5,y1)),DEPTH_COLOUR,2,cv2.LINE_AA)
+    # Short callouts close to points; not on top of the surface being evaluated.
+    for label,point,colour in (('HC',crease,DEPTH_COLOUR),('KT',knee_top,DEPTH_REFERENCE_COLOUR)):
+        lx=max(2,min(width-45,point[0]-33))
+        ly=max(18,min(height-16,point[1]-12))
+        cv2.putText(image,label,(lx,ly),cv2.FONT_HERSHEY_SIMPLEX,.42,(0,0,0),3,cv2.LINE_AA)
+        cv2.putText(image,label,(lx,ly),cv2.FONT_HERSHEY_SIMPLEX,.42,colour,1,cv2.LINE_AA)

@@ -1,3 +1,14 @@
+# SquatVision changelog
+
+## 3.0.0 — 2026-10-18
+
+- Added optional manual hip-crease and knee-top reference point calibration.
+- Added per-frame thigh-attached propagation of both depth points in `squatvision/depth.py`.
+- Added independent depth readout and dashed guides to annotated MP4 and all detected phase screenshots.
+- Added signed vertical depth and classification in `events.csv`, `events.json`, `frames.csv` and attempt summaries.
+- Added calibration preview and regression/integration tests.
+- Preserved legacy angle tracking and explicitly marked uncalibrated anatomical depth as unavailable.
+
 # Changelog
 
 ## 2.0.0 — 2026-10-16

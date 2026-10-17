@@ -21,6 +21,10 @@ class FrameMetrics:
     visibility: Optional[float] = None
     side: Optional[str] = None
     points: Optional[tuple[tuple[float, float], ...]] = None
+    # Manually calibrated anatomical surface point estimates, separate from joint centres.
+    crease_point: Optional[tuple[float, float]] = None
+    knee_top_point: Optional[tuple[float, float]] = None
+    crease_to_knee_top_delta: Optional[float] = None
 
     @property
     def depth_delta(self) -> Optional[float]:
@@ -69,6 +73,8 @@ class Attempt:
     hip_drop: float
     hip_below_knee_proxy: Optional[bool]
     bottom_pause_s: float
+    max_crease_depth_delta: Optional[float] = None
+    crease_below_knee_top_observed: Optional[bool] = None
     events: list[PhaseEvent] = field(default_factory=list)
     note: str = ''
 
@@ -87,6 +93,7 @@ class Analysis:
     upright_hip_y: Optional[float]
     candidate_cycles_rejected: int = 0
     warning: str = ''
+    smoothed_crease_depth: list[Optional[float]] = field(default_factory=list)
 
     @property
     def completed(self) -> list[Attempt]:
@@ -204,6 +211,8 @@ def analyse(frames: list[FrameMetrics], config: Config | None = None) -> Analysi
                          config.smoothing_radius)
     hip = median_smooth([f.hip_y if f.knee_deg is not None else None for f in frames],
                         config.smoothing_radius)
+    crease_depth = median_smooth([f.crease_to_knee_top_delta for f in frames],
+                                 config.smoothing_radius)
     valid = [i for i in range(len(frames)) if knee[i] is not None and hip[i] is not None]
     if len(valid) < 10:
         return Analysis([], knee, hip, None, None, warning='Too few usable pose frames.')
@@ -258,6 +267,7 @@ def analyse(frames: list[FrameMetrics], config: Config | None = None) -> Analysi
                 raise AssertionError('Incomplete attempts cannot have lockout events')
         delta = [frames[i].depth_delta for i in idx if frames[i].depth_delta is not None]
         hip_angles = [frames[i].hip_deg for i in idx if frames[i].hip_deg is not None]
+        crease_deltas = [crease_depth[i] for i in idx if crease_depth[i] is not None]
         # hip joint landmark vs knee joint landmark - a perspective-dependent proxy.
         depth = max(delta) >= 0.015 if delta else None
         attempts.append(Attempt(
@@ -266,7 +276,10 @@ def analyse(frames: list[FrameMetrics], config: Config | None = None) -> Analysi
             duration_s=round(duration,2), knee_min_deg=round(knee_min,1),
             hip_min_deg=round(min(hip_angles),1) if hip_angles else None,
             hip_drop=round(max_drop,4), hip_below_knee_proxy=depth,
-            bottom_pause_s=pause, events=events,
+            bottom_pause_s=pause,
+            max_crease_depth_delta=round(max(crease_deltas),4) if crease_deltas else None,
+            crease_below_knee_top_observed=(max(crease_deltas) > .01) if crease_deltas else None,
+            events=events,
             note=('Estimated standing return, not verified joint lockout' if complete else
                   'Heuristic detection, manual review necessary' if failure_index is not None else
                   'No sustained standing return captured; may be a cropped clip'),
@@ -321,4 +334,4 @@ def analyse(frames: list[FrameMetrics], config: Config | None = None) -> Analysi
                 return_first = None
     if mode == 'moving' and start is not None:
         close_attempt(len(frames)-1, complete=False)
-    return Analysis(attempts, knee, hip, round(ref_knee,2), round(base_hip,4), rejected, warning)
+    return Analysis(attempts, knee, hip, round(ref_knee,2), round(base_hip,4), rejected, warning, crease_depth)

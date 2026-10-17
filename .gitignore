@@ -11,3 +11,9 @@ outputs/
 *.avi
 *.png
 .env
+
+# Local anatomical reference-point selections (not required for source distribution)
+depth_calibration.json
+
+app.py.bak
+squatvision_debug_hotfix.py
