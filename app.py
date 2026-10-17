@@ -13,7 +13,9 @@ import cv2
 import numpy as np
 from squatvision.analysis import Analysis, Config, FrameMetrics, analyse
 from squatvision.geometry import best_side, extract_frame
-from squatvision.depth import DepthCalibration, apply_depth_calibration, depth_status
+from squatvision.depth import DepthCalibration, classify_depth, depth_status
+from squatvision.optical_flow import track_anatomy
+from squatvision.diagnostics import export_plots
 from squatvision.render import overlay, screenshot_name
 
 
@@ -93,8 +95,6 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
                            if selected_side else FrameMetrics(frame_index,t))
                 else:
                     point=FrameMetrics(frame_index,t,side=selected_side)
-                if calibration is not None:
-                    point=apply_depth_calibration(point,calibration,width,height)
                 frames.append(point)
                 frame_index+=1
                 if len(frames)%150==0:
@@ -104,6 +104,8 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
     elapsed=time.perf_counter()-t0
     if not frames:
         raise SystemExit('No frames selected for analysis.')
+    if calibration is not None:
+        frames=track_anatomy(video,frames,calibration,width,height)
     result=analyse(frames,config)
     output.mkdir(parents=True,exist_ok=True)
     shots=output/'event_screenshots'
@@ -111,6 +113,33 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
     index_by_frame={p.frame:p for p in frames}
     events=[]
     smoothed_by_frame={f.frame:result.smoothed_crease_depth[i] for i,f in enumerate(frames)}
+    # Compute high-confidence depth maxima independently of knee-angle rep phases.
+    rep_depth={}
+    for att in result.attempts:
+        candidates=[f for f in frames if att.start_s<=f.time_s<=att.end_s
+                    and f.crease_to_knee_top_delta is not None
+                    and min(f.hip_crease_tracking_confidence or 0,
+                            f.knee_top_tracking_confidence or 0)>=.5]
+        if candidates:
+            max_frame=max(candidates,key=lambda f:f.crease_to_knee_top_delta)
+            thigh_length=(np.linalg.norm(np.asarray(max_frame.points[1])*[width,height]-
+                                         np.asarray(max_frame.points[2])*[width,height])
+                          if max_frame.points else None)
+            conf=min(max_frame.hip_crease_tracking_confidence,max_frame.knee_top_tracking_confidence)
+            status=classify_depth(max_frame.crease_to_knee_top_delta*height,thigh_length,conf)
+            rep_depth[att.number]={'max_depth_px':round(max_frame.crease_to_knee_top_delta*height,2),
+                    'max_depth_normalized':round(max_frame.crease_to_knee_top_delta*height/thigh_length,4) if thigh_length else None,
+                    'max_depth_frame':max_frame.frame,'max_depth_time_s':round(max_frame.time_s,3),
+                    'max_depth_hip_crease_xy':max_frame.crease_point,
+                    'max_depth_knee_top_xy':max_frame.knee_top_point,
+                    'max_depth_status':status,'max_depth_tracking_confidence':round(conf,3),
+                    'depth_unavailable_reason':''}
+        else:
+            rep_depth[att.number]={'max_depth_px':None,'max_depth_normalized':None,
+                    'max_depth_frame':None,'max_depth_time_s':None,
+                    'max_depth_hip_crease_xy':None,'max_depth_knee_top_xy':None,
+                    'max_depth_status':'unavailable','max_depth_tracking_confidence':0,
+                    'depth_unavailable_reason':'no_confident_anatomical_tracking'}
     for att in result.attempts:
         for e in att.events:
             event_frame=index_by_frame[e.frame]
@@ -124,9 +153,17 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
                            'crease_minus_knee_top_px':round(event_frame.crease_to_knee_top_delta*height,2)
                                    if event_frame.crease_to_knee_top_delta is not None else None,
                            'crease_minus_knee_top_norm':event_frame.crease_to_knee_top_delta,
-                           'crease_depth_status':depth_status(smoothed_delta),
+                           'crease_depth_status':classify_depth(smoothed_delta*height if smoothed_delta is not None else None,
+                               np.linalg.norm((np.asarray(event_frame.points[1])-np.asarray(event_frame.points[2]))*[width,height])
+                               if event_frame.points else None,
+                               min(event_frame.hip_crease_tracking_confidence or 0,event_frame.knee_top_tracking_confidence or 0)),
                            'smoothed_crease_minus_knee_top_norm':smoothed_delta,
-                           'depth_method':'manually_calibrated_thigh_attached' if calibration else 'not_calibrated'})
+                           'depth_method':event_frame.depth_tracking_method,
+                           'hip_crease_x':event_frame.crease_point[0] if event_frame.crease_point else None,
+                           'knee_top_x':event_frame.knee_top_point[0] if event_frame.knee_top_point else None,
+                           'hip_crease_tracking_confidence':event_frame.hip_crease_tracking_confidence,
+                           'knee_top_tracking_confidence':event_frame.knee_top_tracking_confidence,
+                           'depth_tracking_reason':event_frame.depth_unavailable_reason})
     by_frame:dict[int,list[dict]]={}
     for e in events:
         by_frame.setdefault(e['frame'],[]).append(e)
@@ -173,22 +210,50 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
             'knee_top_x':p.knee_top_point[0] if p.knee_top_point else None,
             'knee_top_y':p.knee_top_point[1] if p.knee_top_point else None,
             'crease_minus_knee_top_norm':p.crease_to_knee_top_delta,
-            'crease_depth_status':depth_status(result.smoothed_crease_depth[i]),
+            'crease_depth_status':classify_depth(result.smoothed_crease_depth[i]*height
+                if result.smoothed_crease_depth[i] is not None else None,
+                np.linalg.norm((np.asarray(p.points[1])-np.asarray(p.points[2]))*[width,height])
+                if p.points else None,
+                min(p.hip_crease_tracking_confidence or 0,p.knee_top_tracking_confidence or 0)),
             'smoothed_crease_minus_knee_top_norm':result.smoothed_crease_depth[i],
+            'timestamp_s':p.time_s,
+            'hip_crease_x':p.crease_point[0]*width if p.crease_point else None,
+            'hip_crease_y':p.crease_point[1]*height if p.crease_point else None,
+            'knee_top_x_px':p.knee_top_point[0]*width if p.knee_top_point else None,
+            'knee_top_y_px':p.knee_top_point[1]*height if p.knee_top_point else None,
+            'depth_difference_px':p.crease_to_knee_top_delta*height if p.crease_to_knee_top_delta is not None else None,
+            'depth_difference_normalized':(p.crease_to_knee_top_delta*height /
+                np.linalg.norm((np.asarray(p.points[1])-np.asarray(p.points[2]))*[width,height]))
+                if p.crease_to_knee_top_delta is not None and p.points and
+                   np.linalg.norm((np.asarray(p.points[1])-np.asarray(p.points[2]))*[width,height])>0 else None,
+            'depth_status':classify_depth(p.crease_to_knee_top_delta*height if p.crease_to_knee_top_delta is not None else None,
+                np.linalg.norm((np.asarray(p.points[1])-np.asarray(p.points[2]))*[width,height]) if p.points else None,
+                min(p.hip_crease_tracking_confidence or 0,p.knee_top_tracking_confidence or 0)),
+            'hip_crease_tracking_confidence':p.hip_crease_tracking_confidence,
+            'knee_top_tracking_confidence':p.knee_top_tracking_confidence,
+            'depth_tracking_method':p.depth_tracking_method,
+            'depth_unavailable_reason':p.depth_unavailable_reason,
         })
     export_csv(output/'frames.csv',per_frame,list(per_frame[0]))
     attempt_rows=[]
     for a in result.attempts:
-        attempt_rows.append({k:v for k,v in a.as_dict().items() if k!='events'})
-    export_csv(output/'attempts.csv',attempt_rows,
-               ['number','outcome','start_s','end_s','duration_s','knee_min_deg',
-                'hip_min_deg','hip_drop','hip_below_knee_proxy','bottom_pause_s',
-                'max_crease_depth_delta','crease_below_knee_top_observed','note'])
+        attempt_rows.append({**{k:v for k,v in a.as_dict().items() if k!='events'},
+                             **rep_depth[a.number]})
+    attempt_fields=list(attempt_rows[0]) if attempt_rows else [
+        'number','outcome','start_s','end_s','duration_s','knee_min_deg',
+        'hip_min_deg','hip_drop','hip_below_knee_proxy','bottom_pause_s',
+        'max_crease_depth_delta','crease_below_knee_top_observed','note',
+        'max_depth_px','max_depth_normalized','max_depth_frame','max_depth_time_s',
+        'max_depth_hip_crease_xy','max_depth_knee_top_xy','max_depth_status',
+        'max_depth_tracking_confidence','depth_unavailable_reason']
+    export_csv(output/'attempts.csv',attempt_rows,attempt_fields)
     export_csv(output/'events.csv',events,
                ['attempt','outcome','event','timestamp_s','timestamp_hms','frame','image',
                 'crease_y','knee_top_y','crease_minus_knee_top_px',
                 'crease_minus_knee_top_norm','crease_depth_status','depth_method',
-                'smoothed_crease_minus_knee_top_norm'])
+                'smoothed_crease_minus_knee_top_norm','hip_crease_x','knee_top_x',
+                'hip_crease_tracking_confidence','knee_top_tracking_confidence',
+                'depth_tracking_reason'])
     summary={
         'source':video.name,'resolution':[width,height],'fps':fps,
         'analysed_frames':len(frames),'selected_side':selected_side,
@@ -205,10 +270,13 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
         'depth_calibration_applied':calibration is not None,
         'depth_calibration_reference_s':calibration.reference_time_s if calibration else None,
         'depth_method':calibration.method if calibration else 'not_calibrated',
-        'depth_metric_note':'Selected anatomical reference points are propagated using thigh pose; 2D approximate, not validated judging.',
+        'depth_metric_note':'Manually clicked anatomical surface references are independently tracked via local visual flow; 2D approximate, not validated judging.',
+        'per_attempt_depth':rep_depth,
         'warning':result.warning,
         'limitations':'2D view-dependent heuristics; NOT competition-validated depth or failure detection.',
     }
+    if calibration is not None:
+        export_plots(frames,output/'diagnostics',height,width)
     (output/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
     (output/'events.json').write_text(json.dumps(events,indent=2),encoding='utf-8')
     print(json.dumps(summary,indent=2))

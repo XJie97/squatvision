@@ -20,3 +20,20 @@
 - Added CSV/JSON event output, tunable conservative thresholds and clip time selection.
 - Added multi-scenario unit tests for rep-count regressions, pauses, reversals and missing landmarks.
 - Left true source-video accuracy unverified until an annotated ground-truth example is available.
+
+## v4 — Independent local visual tracking and depth diagnostics
+
+- Replace pose-only reference-point propagation with independent LK optical-flow visual tracking initiated from actual manually selected source-video pixels; reject inadequate texture and inconsistent motion.
+- Add manual multi-anchor calibration to support validated reinitialisation after visual tracking loss.
+- Add zoomable marker-editor, pose reference overlays, pixel offsets, customizable point selection and nearby-frame visual preview.
+- Add uncertainty-aware 2D depth status, normalisation by projected thigh length, peak-depth frame and timestamp, and diagnostic SVG plots.
+- Add `validate_depth.py` for independent annotated-frame reference error measurement.
+- Preserve squat repetition state machine and event screenshots.
+- The actual recorded squat has not been provided to this environment: no real-video accuracy claim is made.
+
+### Real-video inspection follow-up
+
+- Located and examined original `squat.mp4`, confirming significant horizontal body movement and temporary obstruction.
+- Detected an additional visual optical-flow failure on the actual footage: high-confidence background attachment near the knee and low-texture loss near the hip reference.
+- Added a stronger pose-motion gate and multiple manually clicked reference points for reinitialisation, as well as a short-clip sequential grayscale cache.
+- MediaPipe and its model are unavailable in this sandbox; see `REAL_VIDEO_VALIDATION.md` for exactly what was and was not verified.

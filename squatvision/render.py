@@ -6,7 +6,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from .analysis import Analysis, FrameMetrics, PhaseEvent
-from .depth import depth_status
+from .depth import depth_status, classify_depth
 
 KNEE_COLOUR = (255, 229, 70)  # Cyan-yellow in OpenCV BGR
 HIP_COLOUR = (68, 164, 255)   # Orange
@@ -97,14 +97,15 @@ def overlay(frame: np.ndarray, point: FrameMetrics, analysis: Analysis,
           if point.knee_deg is not None and point.hip_deg is not None else 'Pose unavailable / low confidence',
           f'Side {point.side or "unknown"} | 2D estimates only']
     if point.crease_to_knee_top_delta is not None:
-        from .depth import depth_status
         dy=point.crease_to_knee_top_delta * h
-        label={'crease_below_knee_top':'BELOW',
-               'crease_above_knee_top':'ABOVE',
-               'near_level_uncertain':'NEAR LEVEL'}[depth_status(point.crease_to_knee_top_delta)]
-        rows.append(f'Crease-knee top: {dy:+.1f}px | {label}*')
+        length=hypot((point.points[2][0]-point.points[1][0])*w,
+                     (point.points[2][1]-point.points[1][1])*h) if point.points else None
+        conf=min(point.hip_crease_tracking_confidence or 0.,
+                 point.knee_top_tracking_confidence or 0.)
+        label=classify_depth(dy,length,conf).replace('_estimate','').upper().replace('_',' ')
+        rows.append(f'Depth {dy:+.1f}px | {label}')
     else:
-        rows.append('Crease-knee top: NOT CALIBRATED')
+        rows.append('Depth: UNAVAILABLE (tracking lost)')
     if event_label:
         rows.append(f'EVENT: {event_label.replace("_"," ").upper()}')
     for i,t in enumerate(rows):
@@ -169,8 +170,8 @@ def draw_depth_guides(image: np.ndarray, frame: FrameMetrics):
         for y in range(y0,y1,11):
             cv2.line(image,(bracket_x,y),(bracket_x,min(y+5,y1)),DEPTH_COLOUR,2,cv2.LINE_AA)
     # Short callouts close to points; not on top of the surface being evaluated.
-    for label,point,colour in (('HC',crease,DEPTH_COLOUR),('KT',knee_top,DEPTH_REFERENCE_COLOUR)):
-        lx=max(2,min(width-45,point[0]-33))
+    for label,point,colour in (('Hip Crease',crease,DEPTH_COLOUR),('Knee Top',knee_top,DEPTH_REFERENCE_COLOUR)):
+        lx=max(2,min(width-99,point[0]-72))
         ly=max(18,min(height-16,point[1]-12))
         cv2.putText(image,label,(lx,ly),cv2.FONT_HERSHEY_SIMPLEX,.42,(0,0,0),3,cv2.LINE_AA)
         cv2.putText(image,label,(lx,ly),cv2.FONT_HERSHEY_SIMPLEX,.42,colour,1,cv2.LINE_AA)

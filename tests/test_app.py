@@ -77,8 +77,8 @@ class TestExports(unittest.TestCase):
                 self.assertTrue(image.exists(), f'Missing {image}')
                 self.assertIsNotNone(cv2.imread(str(image)))
                 self.assertGreater(float(e['timestamp_s']),0.)
-            # Regression: a calibrated run must annotate each critical-position
-            # capture and include independent depth data in event CSV/JSON.
+            # Texture-free synthetic video: optical flow MUST report unavailable
+            # instead of fabricating depths from thigh pose geometry.
             reference=decorated[0]
             calibration=DepthCalibration.from_reference(
                 reference, (reference.points[1][0]*320+8,reference.points[1][1]*480+14),
@@ -97,13 +97,15 @@ class TestExports(unittest.TestCase):
                 calibrated_events=list(csv.DictReader(f))
             self.assertEqual(len(calibrated_events),4)
             for event in calibrated_events:
-                self.assertNotEqual(event['crease_minus_knee_top_px'],'')
-                self.assertNotEqual(event['crease_depth_status'],'unavailable')
-                self.assertEqual(event['depth_method'],'manually_calibrated_thigh_attached')
+                self.assertEqual(event['crease_minus_knee_top_px'],'')
+                self.assertEqual(event['crease_depth_status'],'unavailable')
+                self.assertEqual(event['depth_method'],'local_optical_flow')
                 self.assertTrue((calibrated_output/event['image']).is_file())
             with (calibrated_output/'frames.csv').open() as f:
                 rows=list(csv.DictReader(f))
-            self.assertTrue(all(row['crease_y'] and row['knee_top_y'] for row in rows))
+            self.assertTrue(all(row['depth_status']=='unavailable' for row in rows))
+            self.assertEqual(calibrated['per_attempt_depth']['1']['max_depth_status'],'unavailable')
+            self.assertTrue((calibrated_output/'diagnostics'/'tracking_confidence.svg').exists())
             self.assertNotIn('depth_calibration.json', [p.name for p in calibrated_output.iterdir()])
 
 

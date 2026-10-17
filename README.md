@@ -271,3 +271,94 @@ Video processing runs locally after the pretrained model is downloaded. Videos, 
 SquatVision is intended for **learning, experimentation and computer vision demonstrations**. Anatomical depth requires manual reference-point selection and remains an unvalidated, view-dependent estimate. It is not a validated tool for medical advice, injury prediction or official powerlifting judging.
 
 The repository's source code is MIT-licensed. The downloaded pretrained model and dependencies are third-party components subject to their respective terms.
+
+---
+
+## v4: Visually tracked anatomical reference points and IPF-depth estimate
+
+**Important migration:** The old v3 calibration stored only thigh-relative coordinates. It cannot recover the exact clicked point or visually track surface anatomy. **Recalibrate with v4**; using a v1 calibration with the new visual tracker raises an explicit error rather than silently producing unverified point trajectories.
+
+Official [IPF Technical Rulebook (effective 1 March 2026)](https://www.powerlifting.sport/fileadmin/ipf/data/rules/technical-rules/english/2026_IPF_Technical_Rulebook__effective_01_March_2026__v3.pdf): for the squat, the top surface of the legs at the hip joint must descend below the top of the knees. SquatVision reports only an **estimated 2D vertical relationship**, not an official adjudication. A calibrated visible crease may not exactly represent the legally relevant hip-joint top surface.
+
+### Why the old visual tracking was misleading
+
+In v3 both manually clicked surface points were stored in a coordinate system attached to **the same MediaPipe thigh segment**. Every subsequent point was reconstructed from estimated hip and knee joint centres. It was a pose-based geometric projection, not independent anatomical tracking. The transform could theoretically move horizontally, but it did not have independent visual evidence for the actual crease or knee surface and could drift or appear nearly vertical.
+
+v4 starts from actual clicked pixels on a chosen reference frame and uses **two independent local feature groups** with OpenCV pyramidal Lucas–Kanade flow, forward/backward flow checks, RANSAC partial-affine estimation, pose-consistency checks and an uncertainty gate. A lost marker is withheld; it is **never secretly replaced** with a pseudo-anatomical point generated from joint geometry. Additional manually selected reference frames can restore a lost track. It remains vulnerable to clothing texture movement, occlusion, incorrect point selections and oblique camera views. Tracking confidence is a quality heuristic, not a statistically calibrated probability of anatomical correctness.
+
+### Recommended commands (Windows PowerShell)
+
+```powershell
+cd C:\path\to\squatvision
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python download_model.py
+
+# Re-select the exact anatomical references using the upgraded calibration GUI.
+python calibrate_depth.py --input data/squat.mp4 --time 71.490 --side right --output depth_calibration_v4.json
+
+# If tracking becomes unavailable during a phase, annotate another *different* frame.
+# This preserves the original anchor and adds a manually verified reinitialisation.
+python calibrate_depth.py --input data/squat.mp4 --time 73.600 --side right --append depth_calibration_v4.json --output depth_calibration_v4.json
+
+# Run only the relevant clip; the calibration reference must fall within this window.
+python app.py --input data/squat.mp4 --side right --start-time 64 --end-time 80 --min-visibility 0.30 --depth-calibration depth_calibration_v4.json --output outputs/v4_right
+
+python -m unittest discover -s tests -v
+```
+
+Interactive calibration controls: **1** selects hip crease, **2** selects knee top; click either the full frame or **4× zoom window** to set/reposition each point; `+` and `-` change zoom, **P** previews the nearby movement, **Enter/Space/S** validates and saves, **R** resets, and **Esc** cancels. Orange crosses indicate MediaPipe joint centres, **not** the anatomical surfaces. Colored circles indicate independently clicked references. The reference GUI displays distances from those joints and saves a local nearby-frames preview.
+
+You may also supply `--hip-crease 128,274 --knee-top 202,329` for a headless calibration **only if those coordinates were actually verified on the same source frame**; they are not default ground truth.
+
+### Depth interpretation
+
+For source image coordinates, where Y increases downwards:
+
+```text
+depth_difference_px = hip_crease_y_px - knee_top_y_px
+normalised_depth = depth_difference_px / estimated_thigh_length_px
+```
+
+- Positive means **estimated** hip crease lower in the image.
+- Negative means **estimated** hip crease higher in the image.
+- Near-zero values are `near_threshold_uncertain` based on a minimum 6 px tolerance or 2.5% of estimated thigh length.
+- Poor optical flow, missing pose, occlusion and inadequate texture produce `uncertain`/`unavailable`, never a purported official legal-depth decision.
+
+The `frames.csv` export retains v3 fields and adds independent **pixel X/Y**, `depth_difference_px`, `depth_difference_normalized`, per-point tracking confidence, depth status and any failure reason. The `attempts.csv` and `summary.json` include a maximum measured depth, timestamp, frame and both reference positions for each attempt when tracking is sufficiently confident; missing measurements remain missing. The `events.csv` and PNG event screenshots preserve descent, bottom, ascent, lockout and suspected-failure information.
+
+Five dependency-free SVG plots appear in `outputs/v4_right/diagnostics/`: hip-crease X/Y over time, knee-top X/Y over time, relative depth over time, and tracking confidence over time. Open in any browser; absent data breaks lines instead of connecting missing measurements.
+
+### Manual ground-truth evaluation
+
+Annotate at least 5–10 frames from your **original unannotated recording** across standing, descent, bottom and ascent. Each label must contain **source-video pixels** in the following CSV structure:
+
+```csv
+frame,hip_crease_x,hip_crease_y,knee_top_x,knee_top_y
+2100,128,274,202,329
+```
+
+The above row is a **format example only**; replace it with genuinely inspected annotations for each frame. Compare against the generated predictions:
+
+```powershell
+python validate_depth.py --frames outputs/v4_right/frames.csv --ground-truth manually_checked_points.csv --output outputs/v4_right/depth_validation.json
+```
+
+This reports per-point Euclidean errors, depth difference error and measurement coverage. Include unavailable frames in coverage when reporting the result. Do not claim accuracy based solely on passing synthetic tests or on MediaPipe's pose visibility score.
+
+### Video assumptions and limitations
+
+- A single athlete with the selected body side clearly visible; **multi-person subject re-identification is not yet implemented**. Verify that an apparent switch to another person has not occurred. When in doubt, stop interpreting the depth result.
+- Source recording is constant frame rate, same resolution as calibration and fixed camera. A near-perpendicular side view reduces perspective errors; a single 2D camera still cannot establish depth with referee-level certainty.
+- Point trackers follow **local image texture**, which may move relative to the true anatomical surface when shorts shift or the knee is covered. Feature groups may fail, or appear confident while tracking the wrong textured feature.
+- Each manually verified extra reference can reinitialise tracking over a portion of the clip. References are not automatically fabricated after tracking loss.
+- Computation makes an additional video pass and may be slower for long clips, particularly when seeking backwards from a calibration anchor. Restrict analysis to the squat with `--start-time` and `--end-time`.
+- IPF validity also depends on other rules (commands, movement, stability), so **“estimated below” is not equivalent to “good lift.”**
+
+### Validation status
+
+Regression tests include independent horizontal/vertical trajectories with changing signed depth, insufficient visual texture, incorrect body side, persistence of phase/event exports, calibration JSON compatibility, and missing-data handling. These are **synthetic software tests**. The original workout footage was not supplied in the current execution environment; real anatomical error, actual squat depth and true rep count must be checked on the user's source recording.
+
+**Real recording diagnostic note:** On the supplied original video, isolated texture-only flow was found to stick to a static region near the knee and lose the hip region. v4 includes a pose-motion gate to reject such outcomes rather than showing incorrect anatomical measurements. The final pose-guided tracker still requires evaluation with MediaPipe on the original file; see [`REAL_VIDEO_VALIDATION.md`](REAL_VIDEO_VALIDATION.md) for a precise validation status.

@@ -17,3 +17,7 @@ depth_calibration.json
 
 app.py.bak
 squatvision_debug_hotfix.py
+
+# Local depth annotations and labels
+depth_calibration*.json
+manually_checked_points.csv

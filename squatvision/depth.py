@@ -49,7 +49,11 @@ class DepthCalibration:
     source_width: int
     source_height: int
     method: str = 'manual_two_point_thigh_attached'
-    version: int = 1
+    version: int = 2
+    reference_hip_crease_px: Optional[tuple[float, float]] = None
+    reference_knee_top_px: Optional[tuple[float, float]] = None
+    # Additional manually verified anchors: (frame, crease_x,crease_y,knee_x,knee_y)
+    additional_references: tuple[tuple[int,float,float,float,float], ...] = ()
 
     @classmethod
     def from_reference(cls, frame: FrameMetrics,
@@ -73,15 +77,36 @@ class DepthCalibration:
                 raise ValueError(f'{title} selection is too far from estimated joint; review landmark side.')
         ca,cv = _coeff(hip_crease_xy, hip, size, ex, ey)
         ka,kv = _coeff(knee_top_xy, knee, size, ex, ey)
-        return cls(frame.side,ca,cv,ka,kv,frame.frame,frame.time_s,width,height)
+        return cls(frame.side,ca,cv,ka,kv,frame.frame,frame.time_s,width,height,
+                   method='manual_optical_flow_reference', version=2,
+                   reference_hip_crease_px=tuple(hip_crease_xy),
+                   reference_knee_top_px=tuple(knee_top_xy))
 
     def validate(self):
-        if self.version != 1 or self.method != 'manual_two_point_thigh_attached':
+        if (self.version, self.method) not in ((1, 'manual_two_point_thigh_attached'),
+                                                   (2, 'manual_optical_flow_reference')):
             raise ValueError('Unsupported depth-calibration format.')
         if self.side not in ('left', 'right'):
             raise ValueError('Calibration side must be left or right.')
         if self.source_width < 1 or self.source_height < 1:
             raise ValueError('Invalid calibration dimensions.')
+        if self.version == 2:
+            for name, p in [('hip crease', self.reference_hip_crease_px),
+                            ('knee top', self.reference_knee_top_px)]:
+                if p is None or len(p) != 2 or not all(isfinite(v) for v in p):
+                    raise ValueError(f'Invalid {name} reference coordinates')
+                if not (0 <= p[0] < self.source_width and 0 <= p[1] < self.source_height):
+                    raise ValueError(f'{name} reference outside video bounds')
+        seen={self.reference_frame}
+        for item in self.additional_references:
+            if len(item)!=5 or int(item[0])!=item[0] or item[0]<0 or item[0] in seen:
+                raise ValueError('Additional reference frame duplicated or malformed')
+            seen.add(item[0])
+            _,hx,hy,kx,ky=item
+            if not all(isfinite(v) for v in (hx,hy,kx,ky)) or not (
+                0<=hx<self.source_width and 0<=kx<self.source_width and
+                0<=hy<self.source_height and 0<=ky<self.source_height):
+                raise ValueError('Additional reference coordinates outside frame')
         for value in (self.crease_along,self.crease_across,
                       self.knee_top_along,self.knee_top_across):
             if not isfinite(value) or abs(value) > 0.85:
@@ -96,8 +121,15 @@ class DepthCalibration:
     def load(cls, path: Path):
         # Strictly validate keys to avoid silently accepting incompatible formats.
         payload = json.loads(path.read_text(encoding='utf-8'))
-        if set(payload) != set(cls.__dataclass_fields__):
+        required = {name for name, f in cls.__dataclass_fields__.items()
+                    if f.default is __import__('dataclasses').MISSING}
+        if not required.issubset(payload) or not set(payload).issubset(cls.__dataclass_fields__):
             raise ValueError('Calibration JSON has missing or unexpected fields.')
+        if 'additional_references' in payload:
+            payload['additional_references']=tuple(tuple(row) for row in payload['additional_references'])
+        for key in ('reference_hip_crease_px','reference_knee_top_px'):
+            if payload.get(key) is not None:
+                payload[key] = tuple(payload[key])
         calibration = cls(**payload)
         calibration.validate()
         return calibration
@@ -130,7 +162,9 @@ def apply_depth_calibration(frame: FrameMetrics, calibration: DepthCalibration,
         return replace(frame, crease_point=None,knee_top_point=None,
                        crease_to_knee_top_delta=None)
     return replace(frame,crease_point=crease_norm,knee_top_point=top_norm,
-                   crease_to_knee_top_delta=crease_norm[1]-top_norm[1])
+                   crease_to_knee_top_delta=crease_norm[1]-top_norm[1],
+                   hip_crease_tracking_confidence=0., knee_top_tracking_confidence=0.,
+                   depth_tracking_method='geometry_only_unverified')
 
 
 def depth_status(delta: Optional[float], tolerance: float = 0.01) -> str:
@@ -142,3 +176,16 @@ def depth_status(delta: Optional[float], tolerance: float = 0.01) -> str:
     if delta < -tolerance:
         return 'crease_above_knee_top'
     return 'near_level_uncertain'
+
+
+def classify_depth(delta_px: Optional[float], thigh_length_px: Optional[float],
+                   confidence: Optional[float], uncertainty_px: float = 6.0) -> str:
+    """Informational estimate, not IPF adjudication. Never classify weak tracking."""
+    if delta_px is None or thigh_length_px is None or confidence is None:
+        return 'unavailable'
+    if confidence < .5 or thigh_length_px <= 0:
+        return 'uncertain'
+    margin = max(uncertainty_px, .025 * thigh_length_px)
+    if abs(delta_px) <= margin:
+        return 'near_threshold_uncertain'
+    return 'below_estimate' if delta_px > 0 else 'above_estimate'

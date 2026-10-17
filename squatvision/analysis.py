@@ -25,6 +25,10 @@ class FrameMetrics:
     crease_point: Optional[tuple[float, float]] = None
     knee_top_point: Optional[tuple[float, float]] = None
     crease_to_knee_top_delta: Optional[float] = None
+    hip_crease_tracking_confidence: Optional[float] = None
+    knee_top_tracking_confidence: Optional[float] = None
+    depth_tracking_method: str = "not_calibrated"
+    depth_unavailable_reason: str = ""
 
     @property
     def depth_delta(self) -> Optional[float]:
