@@ -24,3 +24,61 @@ manually_checked_points.csv
 
 # Local backup files
 *.bak
+
+# Local backups
+*.bak
+*.orig
+*.rej
+*.backup
+*~
+CHANGELOG_old.md
+
+# Editor settings
+.vscode/
+.idea/
+
+# Python build and testing
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Temporary diagnostics
+*.tmp
+*.log
+
+# Windows files
+Thumbs.db
+Desktop.ini
+
+# Local backups
+*.bak
+*.orig
+*.rej
+*.backup
+*~
+CHANGELOG_old.md
+
+# Editor settings
+.vscode/
+.idea/
+
+# Python build and testing
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Temporary diagnostics
+*.tmp
+*.log
+
+# Windows files
+Thumbs.db
+Desktop.ini

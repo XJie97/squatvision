@@ -12,6 +12,7 @@ from pathlib import Path
 from dataclasses import replace
 from collections import Counter
 import cv2
+from squatvision.video import open_video
 import numpy as np
 from squatvision.analysis import Analysis, Config, FrameMetrics, analyse
 from squatvision.geometry import best_side, extract_frame
@@ -21,6 +22,7 @@ from squatvision.diagnostics import export_plots
 from squatvision.render import overlay, screenshot_name
 from squatvision.batch import BatchInputError, run_batch
 from squatvision.ipf_depth import load_manual, apply_manual, measure, attempt_depth, UNAVAILABLE, MANUAL, VERIFIED
+from squatvision.auto_surface import label_knee_minima
 
 
 def export_csv(path: Path, rows: list[dict], fields: list[str]):
@@ -34,7 +36,8 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
         min_visibility: float, start_time: float, end_time: float | None,
         no_video: bool, depth_calibration: Path | None = None,
         manual_annotations: Path | None = None,
-        manual_only: bool = False) -> None:
+        manual_only: bool = False, auto_bottom: bool = True,
+        bottom_window_s: float = .5) -> None:
     try:
         import mediapipe as mp
     except ImportError as exc:
@@ -50,7 +53,7 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
         raise SystemExit(f'--side {side} conflicts with calibrated side {calibration.side}.')
     if start_time < 0 or (end_time is not None and end_time <= start_time):
         raise SystemExit('Invalid time window. --end-time must be greater than --start-time.')
-    cap=cv2.VideoCapture(str(video))
+    cap=open_video(str(video))
     if not cap.isOpened():
         raise SystemExit(f'Cannot decode video: {video}')
     fps=float(cap.get(cv2.CAP_PROP_FPS))
@@ -146,11 +149,36 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
     if manual_points:
         frames=[apply_manual(f,manual_points[f.frame],width,height)
                 if f.frame in manual_points else f for f in frames]
-    # Distinct data flows: joint centre kinetics -> repetition analysis;
-    # anatomical SURFACE tracking/manual annotations -> IPF relative height.
+    # Detect phase boundaries and the knee-angle minimum independently of IPF depth.
+    result=analyse(frames,config)
+    # Automatically propose visible-silhouette surface references at the actual
+    # minimum knee-angle frame of each detected rep. These are provisional,
+    # not manually verified anatomy and not a competition-depth decision.
+    output.mkdir(parents=True,exist_ok=True)
+    surface_started = time.perf_counter()
+    if auto_bottom and not manual_only:
+        frames, auto_bottom_refs = label_knee_minima(
+            video, frames, result, model, mp, width, height, bottom_window_s,
+            output/'surface_diagnostics')
+    else:
+        auto_bottom_refs = []
+    surface_seconds = time.perf_counter()-surface_started
+    proposal_rows = [dict(rep_number=r['rep_number'], **c)
+                     for r in auto_bottom_refs for c in r.get('candidates', [])]
+    (output/'surface_proposals.json').write_text(json.dumps(proposal_rows, indent=2), encoding='utf-8')
+    proposal_fields = ['rep_number','frame','timestamp_s','status','margin_px','raw_candidate_margin_px','reason','hip_x','hip_y','knee_x','knee_y']
+    flat_proposals = []
+    for row in proposal_rows:
+        flat = {k: row.get(k) for k in proposal_fields}
+        for part in ('hip','knee'):
+            xy = row.get(part, {}).get('point')
+            flat[part+'_x'], flat[part+'_y'] = xy if xy is not None else (None,None)
+        flat_proposals.append(flat)
+    export_csv(output/'surface_proposals.csv', flat_proposals, proposal_fields)
+    # Distinct data flows: joint-centre angles -> repetition analysis;
+    # anatomical SURFACE estimates/manual labels -> IPF relative height.
     measurements=[measure(f,width,height,require_manual_verification=True) for f in frames]
     measurement_by_frame={m.frame:m for m in measurements}
-    result=analyse(frames,config)
     output.mkdir(parents=True,exist_ok=True)
     shots=output/'event_screenshots'
     shots.mkdir(exist_ok=True)
@@ -201,8 +229,14 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
                            'depth_tracking_reason':event_frame.depth_unavailable_reason,
                            'measurement_source':measurement_by_frame[e.frame].measurement_source,
                            'depth_uncertainty_px':measurement_by_frame[e.frame].depth_uncertainty_px})
-    # Add timestamped screenshots for manually annotated frames and peak depths.
+    # Preserve a reviewable image at each automatically identified knee minimum,
+    # even if anatomical segmentation cannot recover the actual surface.
     extra_shots={}
+    for ref in auto_bottom_refs:
+        if ref.get('frame') is not None:
+            frame_id=ref['frame']
+            extra_shots[frame_id]=f'auto_bottom_rep_{ref["rep_number"]:02d}_{frame_id:06d}.png'
+    # Add timestamped screenshots for manually annotated frames and peak depths.
     for frame_id in manual_points:
         if frame_id in index_by_frame:
             extra_shots[frame_id]=f'manual_depth_{frame_id:06d}.png'
@@ -213,7 +247,7 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
     for e in events:
         by_frame.setdefault(e['frame'],[]).append(e)
     # Re-open original video and export annotated screenshots at exact event frames.
-    render_cap=cv2.VideoCapture(str(video))
+    render_cap=open_video(str(video))
     writer=None
     if not no_video:
         writer=cv2.VideoWriter(str(output/'annotated.mp4'),
@@ -230,6 +264,10 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
             frame_events=by_frame.get(item.frame,[])
             label=frame_events[0]['event'] if frame_events else None
             annotated=overlay(raw,item,result,label)
+            from squatvision.render import draw_surface_proposal
+            proposal = next((r for r in proposal_rows if r['frame']==item.frame), None)
+            if proposal:
+                draw_surface_proposal(annotated,proposal)
             if writer is not None:
                 writer.write(annotated)
             if item.frame in extra_shots:
@@ -324,7 +362,11 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
                 p.depth_unavailable_reason or 'no_anatomical_surface_estimate'
                 for p in region if p.crease_point is None or p.knee_top_point is None)),
         }
+    import hashlib
+    with video.open('rb') as source:
+        source_sha256 = hashlib.file_digest(source,'sha256').hexdigest()
     summary={
+        'source_sha256': source_sha256,
         'source':video.name,'resolution':[width,height],'fps':fps,
         'analysed_frames':len(frames),'selected_side':selected_side,
         'usable_pose_fraction':round(sum(p.knee_deg is not None for p in frames)/len(frames),4),
@@ -337,6 +379,8 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
         'inference_ms_per_frame':round(model_s/len(frames)*1000,2),
         'offline_processing_fps':round(len(frames)/elapsed,2),
         'configuration':config.__dict__,
+        'automatic_surface_processing_s':round(surface_seconds,3),
+        'bottom_window_s':bottom_window_s,
         'depth_calibration_applied':depth_calibration is not None,
         'manual_seeded_visual_tracking':manual_seeded_tracking,
         'manual_tracking_warning':manual_tracking_warning,
@@ -348,18 +392,24 @@ def run(video: Path, output: Path, model: Path, side: str, config: Config,
             p.depth_unavailable_reason for p in frames
             if p.depth_tracking_method=='local_optical_flow' and p.crease_point is None)),
         'bottom_tracking_coverage':bottom_tracking_coverage,
+        'auto_bottom_reference_frames':auto_bottom_refs,
+        'auto_bottom_explanation':('Minimum knee angle is a per-repetition review '
+            'reference, NOT the validated greatest IPF depth. Automatically '
+            'proposed thigh silhouettes are unverified surface proxies.'),
         'manual_depth_annotations_applied':bool(manual_points),
         'depth_calibration_reference_s':calibration.reference_time_s if calibration else None,
         'depth_method':('manual_annotation_seeded_optical_flow' if manual_seeded_tracking
                         else calibration.method if calibration else 'manual_frames_only' if manual_points
-                        else 'not_calibrated'),
-        'depth_metric_note':'Optical-flow margins are provisional and not classified as above/below without manual verification. A missing bottom cannot establish insufficient depth. Signed image-plane pixels, not cm. No official IPF ruling.',
+                        else 'auto_surface_multiframe' if any(
+                            r.get('status')=='UNVERIFIED_SURFACE_PROPOSAL' for r in auto_bottom_refs)
+                        else 'unavailable'),
+        'depth_metric_note':'Optical-flow and auto-segmentation margins are provisional and not classified as above/below without manual verification. A missing bottom cannot establish insufficient depth. Signed image-plane pixels, not cm. No official IPF ruling.',
         'per_attempt_depth':rep_depth,
         'ipf_depth_assessments':list(rep_assessments.values()),
         'warning':result.warning,
         'limitations':'2D view-dependent heuristics; NOT competition-validated depth or failure detection.',
     }
-    if calibration is not None or manual_points:
+    if calibration is not None or manual_points or any(r.get('valid_proposal_frames',0) for r in auto_bottom_refs):
         export_plots(frames,output/'diagnostics',height,width)
         from squatvision.ipf_plot import plot_depth
         plot_depth(measurements,output/'depth_vs_time.svg')
@@ -402,9 +452,15 @@ def main():
                    help='Batch: per-video <stem>.json calibration files')
     p.add_argument('--manual-only',action='store_true',
                    help='Disable visual tracking between manually marked frames')
+    p.add_argument('--bottom-window',type=float,default=.5,
+                   help='Seconds either side of each minimum-knee-angle reference (default: .5)')
+    p.add_argument('--no-auto-bottom',action='store_true',
+                   help='Disable automatic silhouette proposals at per-rep minimum knee-angle frames')
     p.add_argument('--depth-calibration',type=Path,default=None,
                    help='Path to JSON created by calibrate_depth.py; required for anatomical depth tracking')
     args=p.parse_args()
+    if not np.isfinite(args.bottom_window) or not 0 < args.bottom_window <= 5:
+        p.error('--bottom-window must be finite and in (0,5] seconds')
     if not 0<=args.min_visibility<=1:
         p.error('--min-visibility must be in [0,1]')
     if not 0<args.min_knee_excursion<150 or not 0<args.min_hip_drop<1:
@@ -417,7 +473,8 @@ def main():
             p.error('--annotations-dir and --calibrations-dir require batch mode.')
         run(args.input, args.output or Path('outputs/demo'), args.model, args.side, config,
             args.min_visibility, args.start_time, args.end_time, args.no_video,
-            args.depth_calibration, args.manual_annotations, args.manual_only)
+            args.depth_calibration, args.manual_annotations, args.manual_only,
+            not args.no_auto_bottom, args.bottom_window)
         return
     # Without --input, batch process all MP4s directly inside data/.
     # Separate folders and per-video annotation files prevent camera mixing.
@@ -432,7 +489,7 @@ def main():
             process_video=lambda video, dest, manual, calibration: run(
                 video, dest, args.model, args.side, config,
                 args.min_visibility, args.start_time, args.end_time, args.no_video,
-                calibration, manual, args.manual_only),
+                calibration, manual, args.manual_only, not args.no_auto_bottom, args.bottom_window),
             annotations_dir=args.annotations_dir,
             calibrations_dir=args.calibrations_dir,
         )

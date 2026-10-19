@@ -204,7 +204,7 @@ def attempt_depth(rows: list[Measurement], start_s: float, end_s: float,
         # the bottom was deep enough. Never convert gaps into an ABOVE verdict.
         status = UNCERTAIN
         if not manual:
-            interpretation = ('Only unverified optical-flow estimates exist. Anatomical locations must '
+            interpretation = ('Only unverified automatic surface estimates exist. Anatomical locations must '
                               'be reviewed on original footage near the squat bottom; no depth verdict.')
         elif bottom_time_s is not None and not any(abs(r.timestamp_s-bottom_time_s) <= .35 for r in manual):
             interpretation = ('Manual annotations do not cover the estimated squat bottom. '

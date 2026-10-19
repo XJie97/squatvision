@@ -15,6 +15,7 @@ import csv
 import json
 
 import cv2
+from squatvision.video import open_video
 import numpy as np
 
 from squatvision.ipf_depth import (ManualPoint, MANUAL, apply_manual, load_manual,
@@ -65,9 +66,11 @@ def render_manual(image: np.ndarray, manual: ManualPoint | None,
 def save_outputs(video: Path, output: Path, fps: float, w: int, h: int,
                  labels: dict[int,ManualPoint]):
     save_manual(output,video.name,w,h,fps,list(labels.values()))
-    shot_dir=output.parent/'manual_depth_screenshots'
+    artifact_dir=output.parent/(output.stem+'_review')
+    artifact_dir.mkdir(parents=True,exist_ok=True)
+    shot_dir=artifact_dir/'screenshots'
     shot_dir.mkdir(parents=True,exist_ok=True)
-    cap=cv2.VideoCapture(str(video))
+    cap=open_video(str(video))
     rows=[]
     try:
         for frame_id,label in sorted(labels.items()):
@@ -82,27 +85,28 @@ def save_outputs(video: Path, output: Path, fps: float, w: int, h: int,
             rows.append(row)
     finally:cap.release()
     if rows:
-        path=output.parent/'manual_depth_results.csv'
+        path=artifact_dir/'manual_depth_results.csv'
         with path.open('w',newline='',encoding='utf-8') as f:
             writer=csv.DictWriter(f,fieldnames=list(rows[0]))
             writer.writeheader();writer.writerows(rows)
-    (output.parent/'manual_depth_results.json').write_text(json.dumps(rows,indent=2),encoding='utf-8')
+    (artifact_dir/'manual_depth_results.json').write_text(json.dumps(rows,indent=2),encoding='utf-8')
     measurements=[measure(apply_manual(FrameMetrics(p.frame,p.frame/fps),p,w,h),w,h)
                   for p in sorted(labels.values(),key=lambda q:q.frame)]
-    plot_depth(measurements,output.parent/'manual_depth_vs_time.svg')
+    plot_depth(measurements,artifact_dir/'manual_depth_vs_time.svg')
     return rows
 
 
 def collect_gui(video: Path, fps: float, width: int, height: int,
                 labels: dict[int,ManualPoint], start: float, end: float,
-                default_uncertainty: float) -> dict[int,ManualPoint] | None:
+                default_uncertainty: float, proposals: dict | None = None,
+                initial_frame: int | None = None, rep_number: int | None = None) -> dict[int,ManualPoint] | None:
     """Interactive frame editor. Return a *copy* of labels only after explicit Save.
 
     Mouse callbacks run during waitKeyEx. An indefinite wait does not redraw on
     clicks, so the GUI polls every 25 ms and repaints when an input changes.
     Closing the native window or pressing Esc cancels without rewriting files.
     """
-    cap = cv2.VideoCapture(str(video))
+    cap = open_video(str(video))
     if not cap.isOpened():
         raise ValueError(f'Cannot open input video: {video}')
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -112,7 +116,9 @@ def collect_gui(video: Path, fps: float, width: int, height: int,
         cap.release()
         raise ValueError('No frames in review interval')
 
-    frame_id = begin
+    frame_id = min(finish, max(begin, initial_frame if initial_frame is not None else begin))
+    proposals = proposals or {}
+    dismissed = set()
     # WINDOW_AUTOSIZE keeps callback pixel coordinates consistent with the
     # image returned by render_manual. A resizeable WINDOW_NORMAL introduces
     # another GUI scaling factor, especially on Windows high-DPI displays.
@@ -139,11 +145,12 @@ def collect_gui(video: Path, fps: float, width: int, height: int,
             selections.append(xy)
             if len(selections) == 2:
                 working_labels[frame_id] = ManualPoint(
-                    frame_id, selections[0], selections[1], default_uncertainty)
+                    frame_id, selections[0], selections[1], default_uncertainty, note=f"rep_number={rep_number}; manually positioned" if rep_number else "manually positioned")
                 selections = []
             dirty = True
         elif evt == cv2.EVENT_RBUTTONDOWN:
             working_labels.pop(frame_id, None)
+            dismissed.add(frame_id)
             selections = []
             dirty = True
 
@@ -158,8 +165,18 @@ def collect_gui(video: Path, fps: float, width: int, height: int,
                     if not ok:
                         raise RuntimeError(f'Cannot read video frame {frame_id}')
                     loaded_frame = frame_id
-                cv2.imshow(window, render_manual(
-                    image, working_labels.get(frame_id), selections, frame_id, fps, zoom))
+                display = render_manual(
+                    image, working_labels.get(frame_id), selections, frame_id, fps, zoom)
+                proposal = proposals.get(frame_id)
+                if proposal and frame_id not in working_labels and frame_id not in dismissed and not selections:
+                    for part in ('hip','knee'):
+                        xy=proposal.get(part,{}).get('point')
+                        if xy is not None:
+                            cv2.drawMarker(display,tuple(round(v*zoom) for v in xy),
+                                           (0,220,255),cv2.MARKER_DIAMOND,14,2)
+                    cv2.putText(display,'UNVERIFIED proposal | U accept pair | click to replace',
+                                (8,90),cv2.FONT_HERSHEY_SIMPLEX,.34,(0,220,255),1,cv2.LINE_AA)
+                cv2.imshow(window, display)
                 dirty = False
 
             # Timed event processing lets the callback trigger an immediate redraw
@@ -182,6 +199,14 @@ def collect_gui(video: Path, fps: float, width: int, height: int,
                     continue
                 return working_labels
 
+            if key in (ord('u'), ord('U')) and not selections and frame_id not in working_labels and frame_id not in dismissed:
+                proposal = proposals.get(frame_id)
+                if proposal:
+                    accepted = accept_proposal(proposal, default_uncertainty, width, height, rep_number)
+                    if accepted is not None:
+                        working_labels[frame_id] = accepted
+                        dirty = True
+                continue
             next_frame = frame_id
             if key in (ord('a'), ord('A'), 2424832, 65361):
                 next_frame = max(begin, frame_id - 1)
@@ -193,6 +218,7 @@ def collect_gui(video: Path, fps: float, width: int, height: int,
                 next_frame = min(finish, frame_id + 10)
             elif key in (ord('r'), ord('R')):
                 working_labels.pop(frame_id, None)
+                dismissed.add(frame_id)
                 selections = []
                 dirty = True
             elif key in (ord('+'), ord('=')):
@@ -213,19 +239,72 @@ def collect_gui(video: Path, fps: float, width: int, height: int,
             pass  # Already closed with the title-bar X.
 
 
+def accept_proposal(proposal, uncertainty, width, height, rep_number=None):
+    """Explicit human acceptance only; partial pairs cannot become labels."""
+    from squatvision.ipf_depth import validate_manual_point
+    hip=proposal.get('hip',{}).get('point')
+    knee=proposal.get('knee',{}).get('point')
+    if hip is None or knee is None:
+        return None
+    point=ManualPoint(int(proposal['frame']),tuple(hip),tuple(knee),uncertainty,
+                      note=f"rep_number={rep_number}; explicitly accepted automatic proposal")
+    validate_manual_point(point,width,height)
+    return point
+
+
 def main():
     p=argparse.ArgumentParser(description='Manually annotate IPF surface references at video frames')
     p.add_argument('--input',type=Path,required=True)
     p.add_argument('--output',type=Path,default=Path('manual_depth.json'))
-    p.add_argument('--start-time',type=float,default=72.)
-    p.add_argument('--end-time',type=float,default=74.)
+    p.add_argument('--start-time',type=float,default=None,
+                   help='Review start; defaults to 0 or auto-selected reference window')
+    p.add_argument('--end-time',type=float,default=None,
+                   help='Review end; defaults to video end or reference window')
+    p.add_argument('--analysis-summary',type=Path,default=None,
+                   help='summary.json from app.py; review its detected minimum knee-angle reference')
+    p.add_argument('--open-best-candidate',action='store_true',
+                   help='Open at the nearest informative raw candidate; still requires manual verification')
+    p.add_argument('--rep-number',type=int,default=1,
+                   help='Choose a repetition from --analysis-summary (default: 1)')
     p.add_argument('--uncertainty-px',type=float,default=6.)
     p.add_argument('--point',action='append',help='Headless/additional annotation FRAME,HIP_X,HIP_Y,KNEE_X,KNEE_Y')
     p.add_argument('--no-gui',action='store_true',help='Only write provided --point annotations')
     a=p.parse_args()
-    cap=cv2.VideoCapture(str(a.input))
+    cap=open_video(str(a.input))
     if not cap.isOpened():p.error('Cannot open input video')
-    fps=cap.get(cv2.CAP_PROP_FPS);w=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH));h=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT));cap.release()
+    fps=cap.get(cv2.CAP_PROP_FPS);w=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH));h=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    count=int(cap.get(cv2.CAP_PROP_FRAME_COUNT));cap.release()
+    if fps<=0 or count<1:p.error('Cannot determine video duration')
+    duration=(count-1)/fps
+    selected_time=None
+    proposals={}
+    initial_frame=None
+    if a.analysis_summary is not None:
+        report=json.loads(a.analysis_summary.read_text(encoding='utf-8'))
+        if report.get('resolution') != [w,h] or abs(report.get('fps',0)-fps) > .05:
+            p.error('Analysis summary resolution/FPS differ from source video')
+        if report.get('source_sha256'):
+            import hashlib
+            with a.input.open('rb') as source:
+                if hashlib.file_digest(source,'sha256').hexdigest() != report['source_sha256']:
+                    p.error('Analysis summary fingerprint differs from source video')
+        if report.get('source')!=a.input.name:
+            p.error('Analysis summary is for a different source video')
+        refs=report.get('auto_bottom_reference_frames',[])
+        ref=next((r for r in refs if r.get('rep_number')==a.rep_number),None)
+        if ref is None or ref.get('timestamp_s') is None:
+            p.error('No valid minimum-knee-angle reference for selected repetition')
+        selected_time=float(ref['timestamp_s'])
+        initial_frame=int(ref['frame'])
+        if a.open_best_candidate and ref.get('suggested_review_frame') is not None:
+            initial_frame=int(ref['suggested_review_frame'])
+        proposals={int(r['frame']):r for r in ref.get('candidates', [])}
+    start=max(0., selected_time-1.) if selected_time is not None else 0.
+    end=min(duration, selected_time+1.) if selected_time is not None else duration
+    start=a.start_time if a.start_time is not None else start
+    end=a.end_time if a.end_time is not None else end
+    if not (0<=start<=duration and 0<=end<=duration and start<end):
+        p.error('Review interval outside source video or has non-positive length')
     if not 0<a.uncertainty_px<max(w,h):p.error('Invalid --uncertainty-px')
     labels=load_manual(a.output,a.input.name,w,h,fps) if a.output.exists() else {}
     for value in a.point or []:
@@ -236,7 +315,8 @@ def main():
         except ValueError:p.error('Invalid --point values')
         labels[frame_id]=ManualPoint(frame_id,(hx,hy),(kx,ky),a.uncertainty_px)
     if not a.no_gui:
-        updated=collect_gui(a.input,fps,w,h,labels,a.start_time,a.end_time,a.uncertainty_px)
+        updated=collect_gui(a.input,fps,w,h,labels,start,end,a.uncertainty_px,
+                            proposals,initial_frame,a.rep_number if a.analysis_summary else None)
         if updated is None:
             print('Manual annotation cancelled. Existing files were not changed.')
             return

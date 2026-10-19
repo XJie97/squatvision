@@ -151,9 +151,9 @@ class ManualDepthTests(unittest.TestCase):
             result=save_outputs(video,root/'manual.json',30,W,H,{3:self.annotation(3)})
             self.assertEqual(len(result),1)
             self.assertEqual(result[0]['measurement_source'],MANUAL)
-            self.assertTrue((root/'manual_depth_results.csv').is_file())
-            self.assertEqual(len(list((root/'manual_depth_screenshots').glob('*.png'))),1)
-            with (root/'manual_depth_results.csv').open() as f:
+            self.assertTrue((root/'manual_review'/'manual_depth_results.csv').is_file())
+            self.assertEqual(len(list((root/'manual_review'/'screenshots').glob('*.png'))),1)
+            with (root/'manual_review'/'manual_depth_results.csv').open() as f:
                 self.assertAlmostEqual(float(list(csv.DictReader(f))[0]['depth_margin_px']),20.)
 
 if __name__=='__main__':unittest.main()

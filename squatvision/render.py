@@ -99,8 +99,9 @@ def overlay(frame: np.ndarray, point: FrameMetrics, analysis: Analysis,
                'Depth: UNAVAILABLE',
                'Surface references not reliable']
     elif m.measurement_source == AUTOMATED:
+        auto_kind=('SEG' if point.depth_tracking_method.startswith('auto_') else 'FLOW')
         lines=[f'{timestamp(point.time_s)}  |  Reps {completed}',
-               f'Depth proxy: {m.depth_margin_px:+.1f}px (FLOW)',
+               f'Depth proxy: {m.depth_margin_px:+.1f}px ({auto_kind})',
                'UNVERIFIED - review bottom frame']
     else:
         short={BELOW:'EST. BELOW',ABOVE:'OBS. ABOVE'}.get(m.depth_status,'BORDERLINE')
@@ -176,3 +177,17 @@ def draw_depth_guides(image: np.ndarray, frame: FrameMetrics):
         yy=max(100,min(height-8,point[1]-9))
         cv2.putText(image,title,(xx,yy),cv2.FONT_HERSHEY_SIMPLEX,.4,(0,0,0),3,cv2.LINE_AA)
         cv2.putText(image,title,(xx,yy),cv2.FONT_HERSHEY_SIMPLEX,.4,col,1,cv2.LINE_AA)
+
+
+def draw_surface_proposal(image, row):
+    """Independent proposal markers; partial/rejected points are not measurements."""
+    h,w=image.shape[:2]
+    for part, color in [('hip',(70,240,70)), ('knee',(245,150,245))]:
+        xy=row.get(part,{}).get('point')
+        if xy is not None:
+            cv2.drawMarker(image,tuple(round(v) for v in xy),color,cv2.MARKER_DIAMOND,10,1)
+    hip='candidate' if row.get('hip',{}).get('point') is not None else 'missing'
+    knee='candidate' if row.get('knee',{}).get('point') is not None else 'missing'
+    _fitted_text(image,f"Hip {hip} / Knee {knee}",h-46,w-12)
+    label = 'MANUAL REVIEWED' if row.get('status')=='MANUAL_VERIFIED' else 'AUTO UNVERIFIED'
+    _fitted_text(image,label+' | see surface diagnostics',h-27,w-12)

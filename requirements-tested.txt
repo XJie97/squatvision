@@ -1,0 +1,4 @@
+# Verified together on Python 3.12. Use a clean virtual environment.
+mediapipe==0.10.21
+opencv-contrib-python==4.11.0.86
+numpy==1.26.4

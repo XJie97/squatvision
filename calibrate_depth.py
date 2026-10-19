@@ -12,6 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import cv2
+from squatvision.video import open_video
 import numpy as np
 
 from squatvision.geometry import best_side, extract_frame
@@ -21,7 +22,7 @@ from squatvision.render import draw_depth_guides
 
 
 def read_frame(video: Path, seconds: float):
-    cap=cv2.VideoCapture(str(video))
+    cap=open_video(str(video))
     if not cap.isOpened():
         raise SystemExit(f'Cannot read video: {video}')
     fps=float(cap.get(cv2.CAP_PROP_FPS))
@@ -65,7 +66,7 @@ def infer_pose(image, model: Path, index: int, timestamp: float, side: str):
 def _tracking_preview(video: Path, cal: DepthCalibration, output: Path,
                       fps: float | None = None) -> Path:
     """Preview reference +/- 0.6s using independent optical flow, no pose fabrication."""
-    capture=cv2.VideoCapture(str(video))
+    capture=open_video(str(video))
     fps=fps or float(capture.get(cv2.CAP_PROP_FPS))
     if not np.isfinite(fps) or fps<=0:
         capture.release()

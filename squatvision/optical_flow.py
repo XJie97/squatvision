@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 import cv2
+from squatvision.video import open_video
 import numpy as np
 
 from .analysis import FrameMetrics
@@ -158,7 +159,7 @@ def track_anatomy(video: Path, frames: list[FrameMetrics], cal: DepthCalibration
     for i in anchor_ids:
         if i in ordered and (ordered[i].side!=cal.side or ordered[i].points is None):
             raise ValueError('No valid corresponding body pose on reference frame.')
-    cap=cv2.VideoCapture(str(video))
+    cap=open_video(str(video))
     if not cap.isOpened():
         raise ValueError(f'Cannot open source video {video}')
     try:

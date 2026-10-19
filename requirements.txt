@@ -1,4 +1,4 @@
 # Python 3.11 or 3.12 recommended. CPU inference is supported.
 mediapipe>=0.10.14,<0.11
-opencv-python>=4.8,<5
+opencv-contrib-python>=4.8,<5
 numpy>=1.26,<3
